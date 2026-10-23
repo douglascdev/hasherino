@@ -14,6 +14,7 @@ import (
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Controlls everything in the app. Called by UI code, making it UI library agnostic.
@@ -277,7 +278,7 @@ func (hc *HasherinoController) AddTempTabs(channelIds *[]string) error {
 						tempFile.Close()
 					}
 					log.Println("Loaded " + strconv.Itoa(len(emoteObjs)) + " 7tv global emotes")
-					result := tx.Create(&emoteObjs)
+					result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&emoteObjs)
 					if result.Error != nil {
 						log.Printf("Failed to save global 7tv emotes: %s", result.Error)
 					}
@@ -346,7 +347,7 @@ func (hc *HasherinoController) AddTempTabs(channelIds *[]string) error {
 					}
 					log.Println("Loaded " + strconv.Itoa(len(emoteObjs)) + " 7tv user emotes for " + channelId)
 					if len(emoteObjs) > 0 {
-						result := tx.Create(&emoteObjs)
+						result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&emoteObjs)
 						if result.Error != nil {
 							return result.Error
 						}
@@ -391,9 +392,9 @@ func (hc *HasherinoController) GetEmotes(search string) ([]*Emote, error) {
 		if result.Error != nil {
 			return result.Error
 		}
-		query := "(owner_id = ? OR owner_id IS ?) AND (channel_id = ? OR channel_id IS NULL) AND (name LIKE ?)"
+		query := "(owner_id = ? OR owner_id = '') AND (channel_id = ? OR channel_id IS NULL) AND (name LIKE ?)"
 		search = "%" + search + "%"
-		result = tx.Where(query, activeAccount.Id, "", tab.Id, search).Find(&emotes)
+		result = tx.Where(query, activeAccount.Id, tab.Id, search).Find(&emotes)
 		log.Println("Query found " + strconv.Itoa(len(emotes)) + " emotes for tab " + tab.Login)
 		if result.Error != nil {
 			return result.Error
