@@ -43,6 +43,13 @@ func (hc *HasherinoController) New(callbackMap map[string]func(ChatMessage)) (*H
 	}
 	memDB.AutoMigrate(&TempTab{}, &ChatUser{}, &Emote{}, &ChatUserTempTab{})
 
+	// ensure the parent directory exists
+	err = os.MkdirAll(dataFolder, os.ModePerm)
+	if err != nil {
+		log.Fatalf("failed to create directory: %v", err)
+	}
+	
+	// open the SQLite database safely
 	permDB, err := gorm.Open(sqlite.Open(filepath.Join(dataFolder, "gorm.db")), &gorm.Config{})
 	if err != nil {
 		return nil, err
