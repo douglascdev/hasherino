@@ -140,7 +140,7 @@ func TestMessageListSetStyle(t *testing.T) {
 
 	list.SetStyle(fyne.NewSize(36, 36), 20, true)
 	timeText, ok := message.content.Objects[0].(*fyneCanvas.Text)
-	if !ok || timeText.Text != "[00:00]" {
+	if !ok || timeText.Text != "00:00" {
 		t.Errorf("expected the message to be rebuilt with the message time, got %T", message.content.Objects[0])
 	}
 }

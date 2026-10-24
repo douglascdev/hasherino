@@ -383,8 +383,6 @@ func NewChatTab(
 		reloaded, err := emoteCache.Refresh()
 		if err != nil {
 			log.Println(err)
-		} else if reloaded {
-			messageList.UpdateEmotes(emoteCache.ByName())
 		}
 
 		settings, err := settingsFunc()
@@ -393,11 +391,17 @@ func NewChatTab(
 			return
 		}
 
-		emoteSize := fyne.NewSize(float32(settings.EmoteSize), float32(settings.EmoteSize))
-		fontSize := float32(settings.FontSize)
-		messageList.SetLimit(settings.ChatMessageLimit)
-		messageList.AddMessage(components.NewMessage(message.Author, message.Text, message.Time, emoteCache.ByName(), emoteSize, fontSize, settings.ShowMessageTime, insertEmote))
-		messageList.ScrollToBottom()
+		fyne.Do(func() {
+			if reloaded {
+				messageList.UpdateEmotes(emoteCache.ByName())
+			}
+
+			emoteSize := fyne.NewSize(float32(settings.EmoteSize), float32(settings.EmoteSize))
+			fontSize := float32(settings.FontSize)
+			messageList.SetLimit(settings.ChatMessageLimit)
+			messageList.AddMessage(components.NewMessage(message.Author, message.Text, message.Time, emoteCache.ByName(), emoteSize, fontSize, settings.ShowMessageTime, insertEmote))
+			messageList.ScrollToBottom()
+		})
 	}
 	go func() {
 		settings, err := settingsFunc()
@@ -436,8 +440,10 @@ func NewChatTab(
 			if len(emoteCache.ByName()) == 0 {
 				continue
 			}
-			messageList.UpdateEmotes(emoteCache.ByName())
-			messageList.ScrollToBottom()
+			fyne.Do(func() {
+				messageList.UpdateEmotes(emoteCache.ByName())
+				messageList.ScrollToBottom()
+			})
 			return
 		}
 	}()

@@ -71,8 +71,10 @@ func (g *WebpWidget) load(read io.Reader) error {
 	if err != nil {
 		return err
 	}
-	g.dst.Image = pix
-	g.dst.Refresh()
+	fyne.Do(func() {
+		g.dst.Image = pix
+		g.dst.Refresh()
+	})
 
 	return nil
 }
@@ -125,7 +127,9 @@ func (g *WebpWidget) LazyLoad() error {
 }
 
 func (g *WebpWidget) LazyUnload() error {
-	g.loadEmptyDst()
+	fyne.Do(func() {
+		g.loadEmptyDst()
+	})
 	return nil
 }
 

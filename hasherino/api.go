@@ -252,7 +252,7 @@ func GetChatHistory(channel string, limit int) (*[]ChatMessage, error) {
 
 	if messagesJson.Error != nil {
 		e := fmt.Sprintf("Failed to get chat history: %s", messagesJson.Error)
-		log.Printf(e)
+		log.Println(e)
 		return nil, errors.New(e)
 	}
 

@@ -170,8 +170,8 @@ func TestMessageSetStyleOnlyRebuildsOnChange(t *testing.T) {
 	if timeText.TextStyle.Bold {
 		t.Error("expected the message time to be non-bold")
 	}
-	if timeText.Text != "[00:00]" {
-		t.Errorf("expected the message time [00:00], got %q", timeText.Text)
+	if timeText.Text != "00:00" {
+		t.Errorf("expected the message time 00:00, got %q", timeText.Text)
 	}
 }
 
@@ -189,8 +189,8 @@ func TestMessageRendersTimeBeforeAuthorWhenEnabled(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected the first object to be the message time, got %T", message.content.Objects[0])
 	}
-	if timeText.Text != "[15:02]" {
-		t.Errorf("expected the message time [15:02], got %q", timeText.Text)
+	if timeText.Text != "15:02" {
+		t.Errorf("expected the message time 15:02, got %q", timeText.Text)
 	}
 	if timeText.TextStyle.Bold {
 		t.Error("expected the message time to be non-bold")

@@ -64,8 +64,10 @@ func (g *EmoteGif) CreateRenderer() fyne.WidgetRenderer {
 // Load is used to change the gif file shown.
 // It will change the loaded content and prepare the new frames for animation.
 func (g *EmoteGif) Load(u fyne.URI) error {
-	g.dst.Image = nil
-	g.dst.Refresh()
+	fyne.Do(func() {
+		g.dst.Image = nil
+		g.dst.Refresh()
+	})
 
 	if u == nil {
 		return nil
@@ -82,8 +84,10 @@ func (g *EmoteGif) Load(u fyne.URI) error {
 // LoadResource is used to change the gif resource shown.
 // It will change the loaded content and prepare the new frames for animation.
 func (g *EmoteGif) LoadResource(r fyne.Resource) error {
-	g.dst.Image = nil
-	g.dst.Refresh()
+	fyne.Do(func() {
+		g.dst.Image = nil
+		g.dst.Refresh()
+	})
 
 	if r == nil || len(r.Content()) == 0 {
 		return nil
@@ -97,8 +101,10 @@ func (g *EmoteGif) load(read io.Reader) error {
 		return err
 	}
 	g.src = pix
-	g.dst.Image = pix.Image[0]
-	g.dst.Refresh()
+	fyne.Do(func() {
+		g.dst.Image = pix.Image[0]
+		g.dst.Refresh()
+	})
 
 	return nil
 }
@@ -116,48 +122,33 @@ func (g *EmoteGif) SetMinSize(min fyne.Size) {
 	g.min = min
 }
 
-func (g *EmoteGif) draw(dst draw.Image, index int) {
-	defer g.dst.Refresh()
-	if g.src == nil || g.src.Image == nil || len(g.src.Image) == 0 {
-		return
-	}
-	if g.dst == nil || g.dst.Image == nil {
-		return
-	}
-	if index == 0 {
-		// first frame
-		draw.Draw(dst, g.dst.Image.Bounds(), g.src.Image[index], image.Point{}, draw.Src)
-		g.dst.Image = dst
-		g.noDisposeIndex = -1
-		return
-	}
-
-	if index >= len(g.src.Disposal) {
-		return
-	}
-	switch g.src.Disposal[index-1] {
+func (g *EmoteGif) draw(dst draw.Image, frame image.Image, dispose byte, index int) {
+	bounds := dst.Bounds()
+	switch dispose {
 	case gif.DisposalNone:
 		// Do not dispose old frame, draw new frame over old
-		draw.Draw(dst, g.dst.Image.Bounds(), g.src.Image[index], image.Point{}, draw.Over)
+		draw.Draw(dst, bounds, frame, image.Point{}, draw.Over)
 		// will be used in case of disposalPrevious
 		g.noDisposeIndex = index - 1
 	case gif.DisposalBackground:
 		// clear with background then render new frame Over it
 		// replacing entirely with new frame should achieve this?
-		draw.Draw(dst, g.dst.Image.Bounds(), g.src.Image[index], image.Point{}, draw.Src)
+		draw.Draw(dst, bounds, frame, image.Point{}, draw.Src)
 	case gif.DisposalPrevious:
-		// restore frame with previous image then render new over it
-		if g.noDisposeIndex >= 0 {
-			draw.Draw(dst, g.dst.Image.Bounds(), g.src.Image[g.noDisposeIndex], image.Point{}, draw.Src)
-			draw.Draw(dst, g.dst.Image.Bounds(), g.src.Image[index], image.Point{}, draw.Over)
+		// restore frame with previous image then render new frame over it
+		if g.noDisposeIndex >= 0 && g.src != nil && g.noDisposeIndex < len(g.src.Image) {
+			draw.Draw(dst, bounds, g.src.Image[g.noDisposeIndex], image.Point{}, draw.Src)
+			draw.Draw(dst, bounds, frame, image.Point{}, draw.Over)
 		} else {
 			// there was no previous graphic, render background instead?
-			draw.Draw(dst, g.dst.Image.Bounds(), g.src.Image[index], image.Point{}, draw.Src)
+			draw.Draw(dst, bounds, frame, image.Point{}, draw.Src)
 		}
 	default:
 		// Disposal = Unspecified/Reserved, simply draw new frame over previous
-		draw.Draw(dst, g.dst.Image.Bounds(), g.src.Image[index], image.Point{}, draw.Over)
+		draw.Draw(dst, bounds, frame, image.Point{}, draw.Over)
 	}
+
+	g.dst.Refresh()
 }
 
 func (g *EmoteGif) loadEmpty() {
@@ -189,11 +180,15 @@ func (g *EmoteGif) Start() {
 	g.running = true
 	g.runLock.Unlock()
 
-	if g.dst.Image == nil || g.src.Image == nil {
+	if g.src == nil || len(g.src.Image) == 0 {
 		return
 	}
-	buffer := image.NewNRGBA(g.dst.Image.Bounds())
-	g.draw(buffer, 0)
+	buffer := image.NewNRGBA(g.src.Image[0].Bounds())
+	fyne.Do(func() {
+		g.dst.Image = buffer
+		g.noDisposeIndex = -1
+		g.draw(buffer, g.src.Image[0], gif.DisposalNone, 0)
+	})
 
 	go func() {
 		switch g.src.LoopCount {
@@ -206,14 +201,21 @@ func (g *EmoteGif) Start() {
 		}
 	loop:
 		for g.remaining != 0 {
-			for c := range g.src.Image {
+			frames := g.src.Image
+			for c, frame := range frames {
+				dispose := byte(gif.DisposalNone)
+				if c > 0 {
+					dispose = g.src.Disposal[c-1]
+				}
 				if g.isStopping() {
 					if g.lazyLoad {
 						g.loadEmpty()
 					}
 					break loop
 				}
-				g.draw(buffer, c)
+				fyne.Do(func() {
+					g.draw(buffer, frame, dispose, c)
+				})
 
 				if g.src == nil || c >= len(g.src.Delay) {
 					break loop
