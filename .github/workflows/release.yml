@@ -11,19 +11,19 @@ on:
 jobs:
 
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v5
       with:
         go-version: '1.22'
 
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install gcc libgl1-mesa-dev xorg-dev gcc-mingw-w64
+        sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev gcc-mingw-w64 libx11-dev libxcursor-dev libxrandr-dev libinerama-dev libxi-dev libxxf86vm-dev
 
     - name: Linux build
       run: go build -v -ldflags "-s -w" -o hasherino-linux
@@ -32,12 +32,13 @@ jobs:
       run: |
         export GOOS=windows
         export GOARCH=amd64
-        export CGO_ENABLED=1 
-        export CC=x86_64-w64-mingw32-gcc 
+        # Turn off CGO for the Windows cross-compile unless you have manually configured an external Windows SDK matrix.
+        # Fyne applications cross-compiling via MinGW need CGO_ENABLED=0 to avoid looking for missing local Windows .dll headers on Linux.
+        export CGO_ENABLED=0 
         go build -v -ldflags "-s -w" -o hasherino-windows.exe
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@v4
       with:
         name: hasherino
         path: |
@@ -49,19 +50,21 @@ jobs:
     needs: build
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Download artifacts
-      uses: actions/download-artifact@v4.1.7
+      # 6. Aligned the download artifact action with the v4 version pattern
+      uses: actions/download-artifact@v4
       with:
-        name: 'hasherino'
-        path: 'artifacts'
+        name: hasherino
+        path: artifacts
     
     - name: Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       if: startsWith(github.ref, 'refs/tags/')
       with:
         token: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
         body_path: CHANGELOG.md
         files: |
           artifacts/*
+
