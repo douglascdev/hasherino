@@ -424,6 +424,7 @@ func NewChatTab(
 				continue
 			}
 			messageList.UpdateEmotes(emoteCache.ByName())
+			messageList.ScrollToBottom()
 			return
 		}
 	}()
