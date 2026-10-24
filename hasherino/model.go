@@ -27,7 +27,14 @@ type AppSettings struct {
 	gorm.Model
 	ChatMessageLimit int // Maximum amount of messages in a single chat
 	ChatHistory      bool
+	EmoteSize        int // Size chat emotes are rendered at, in pixels
+	FontSize         int // Size chat text is rendered at, in pixels
 }
+
+const (
+	DefaultEmoteSize = 36
+	DefaultFontSize  = 18
+)
 
 // --- tempDB models ---
 type EmoteSourceEnum int64

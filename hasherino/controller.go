@@ -69,9 +69,28 @@ func (hc *HasherinoController) New(callbackMap map[string]func(ChatMessage)) (*H
 	settings := &AppSettings{}
 	result := permDB.Take(settings)
 	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-		result = permDB.Create(&AppSettings{ChatMessageLimit: 100, ChatHistory: false})
+		result = permDB.Create(&AppSettings{
+			ChatMessageLimit: 100,
+			ChatHistory:      false,
+			EmoteSize:        DefaultEmoteSize,
+			FontSize:         DefaultFontSize,
+		})
 	} else if result.Error != nil {
 		return nil, err
+	}
+	// settings created before the emote and font size settings existed have
+	// them set to zero, so they need to be filled with the defaults
+	missingDefaults := settings.EmoteSize == 0 || settings.FontSize == 0
+	if settings.EmoteSize == 0 {
+		settings.EmoteSize = DefaultEmoteSize
+	}
+	if settings.FontSize == 0 {
+		settings.FontSize = DefaultFontSize
+	}
+	if missingDefaults {
+		if err := permDB.Save(settings).Error; err != nil {
+			log.Println("Failed to save default settings:", err)
+		}
 	}
 	go c.twitchOAuth.ListenForOAuthRedirect(c)
 	return c, nil

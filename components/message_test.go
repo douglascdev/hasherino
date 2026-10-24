@@ -12,6 +12,11 @@ import (
 	"github.com/Hashy-Software/hasherino-go/hasherino"
 )
 
+var (
+	testEmoteSize = fyne.NewSize(28, 28)
+	testFontSize  = theme.TextSize()
+)
+
 func TestFlowLayoutKeepsObjectsOnOneLineWhenTheyFit(t *testing.T) {
 	app := test.NewApp()
 	defer app.Quit()
@@ -80,7 +85,7 @@ func TestMessageRendersTextAndEmotes(t *testing.T) {
 
 	emote := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "FeelsDankMan"}
 	emotes := map[string]*hasherino.Emote{emote.Name: emote}
-	message := NewMessage("author", "hello FeelsDankMan world", emotes, nil)
+	message := NewMessage("author", "hello FeelsDankMan world", emotes, testEmoteSize, testFontSize, nil)
 
 	emoteWidgets := 0
 	words := 0
@@ -99,11 +104,11 @@ func TestMessageRendersTextAndEmotes(t *testing.T) {
 	if words != 3 {
 		t.Errorf("expected author and 2 words, got %d", words)
 	}
-	if len(message.emotes) != 1 {
-		t.Errorf("expected 1 emote to be tracked, got %d", len(message.emotes))
+	if len(message.emoteWidgets) != 1 {
+		t.Errorf("expected 1 emote to be tracked, got %d", len(message.emoteWidgets))
 	}
-	if message.emotes[0].MinSize() != chatEmoteSize {
-		t.Errorf("expected emote min size %v, got %v", chatEmoteSize, message.emotes[0].MinSize())
+	if message.emoteWidgets[0].MinSize() != testEmoteSize {
+		t.Errorf("expected emote min size %v, got %v", testEmoteSize, message.emoteWidgets[0].MinSize())
 	}
 }
 
@@ -112,19 +117,48 @@ func TestMessageSetEmotesOnlyRebuildsOnChange(t *testing.T) {
 	defer app.Quit()
 
 	emote := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "FeelsDankMan"}
-	message := NewMessage("author", "hello FeelsDankMan", nil, nil)
+	message := NewMessage("author", "hello FeelsDankMan", nil, testEmoteSize, testFontSize, nil)
 
-	if len(message.emotes) != 0 {
-		t.Errorf("expected no emotes to be rendered, got %d", len(message.emotes))
+	if len(message.emoteWidgets) != 0 {
+		t.Errorf("expected no emotes to be rendered, got %d", len(message.emoteWidgets))
 	}
 	if !message.SetEmotes(map[string]*hasherino.Emote{emote.Name: emote}) {
 		t.Error("expected message to be rebuilt when an emote becomes available")
 	}
-	if len(message.emotes) != 1 {
-		t.Errorf("expected 1 emote to be rendered, got %d", len(message.emotes))
+	if len(message.emoteWidgets) != 1 {
+		t.Errorf("expected 1 emote to be rendered, got %d", len(message.emoteWidgets))
 	}
 	if message.SetEmotes(map[string]*hasherino.Emote{emote.Name: emote}) {
 		t.Error("expected message not to be rebuilt when the emotes did not change")
+	}
+}
+
+func TestMessageSetStyleOnlyRebuildsOnChange(t *testing.T) {
+	app := test.NewApp()
+	defer app.Quit()
+
+	emote := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "FeelsDankMan"}
+	emotes := map[string]*hasherino.Emote{emote.Name: emote}
+	message := NewMessage("author", "hello FeelsDankMan", emotes, testEmoteSize, testFontSize, nil)
+
+	if message.SetStyle(testEmoteSize, testFontSize) {
+		t.Error("expected message not to be rebuilt when the style did not change")
+	}
+
+	biggerEmoteSize := fyne.NewSize(36, 36)
+	if !message.SetStyle(biggerEmoteSize, testFontSize) {
+		t.Error("expected message to be rebuilt when the emote size changed")
+	}
+	if message.emoteWidgets[0].MinSize() != biggerEmoteSize {
+		t.Errorf("expected emote min size %v, got %v", biggerEmoteSize, message.emoteWidgets[0].MinSize())
+	}
+
+	if !message.SetStyle(biggerEmoteSize, 20) {
+		t.Error("expected message to be rebuilt when the font size changed")
+	}
+	author := message.content.Objects[0].(*canvas.Text)
+	if author.TextSize != 20 {
+		t.Errorf("expected author text size 20, got %f", author.TextSize)
 	}
 }
 
@@ -132,7 +166,7 @@ func TestMessageWrapsWhenNarrow(t *testing.T) {
 	app := test.NewApp()
 	defer app.Quit()
 
-	message := NewMessage("author", "a fairly long message that has to wrap over multiple lines", nil, nil)
+	message := NewMessage("author", "a fairly long message that has to wrap over multiple lines", nil, testEmoteSize, testFontSize, nil)
 
 	message.Resize(fyne.NewSize(500, 10))
 	wide := message.MinSize().Height

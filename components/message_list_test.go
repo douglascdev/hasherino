@@ -18,8 +18,8 @@ func TestMessageListLaysOutWrappedMessages(t *testing.T) {
 	canvas.SetContent(list)
 	canvas.Resize(fyne.NewSize(300, 100))
 
-	first := NewMessage("author", "a fairly long message that has to wrap over multiple lines", nil, nil)
-	second := NewMessage("author", "another message that is long enough to wrap as well", nil, nil)
+	first := NewMessage("author", "a fairly long message that has to wrap over multiple lines", nil, testEmoteSize, testFontSize, nil)
+	second := NewMessage("author", "another message that is long enough to wrap as well", nil, testEmoteSize, testFontSize, nil)
 	list.AddMessage(first)
 	list.AddMessage(second)
 
@@ -43,7 +43,7 @@ func TestMessageListRelayoutsOnResize(t *testing.T) {
 	canvas.SetContent(list)
 	canvas.Resize(fyne.NewSize(400, 200))
 
-	message := NewMessage("author", "a fairly long message that has to wrap over multiple lines", nil, nil)
+	message := NewMessage("author", "a fairly long message that has to wrap over multiple lines", nil, testEmoteSize, testFontSize, nil)
 	list.AddMessage(message)
 	wide := message.Size().Height
 
@@ -68,9 +68,9 @@ func TestMessageListDropsOldestMessages(t *testing.T) {
 	canvas.SetContent(list)
 	canvas.Resize(fyne.NewSize(300, 200))
 
-	first := NewMessage("first", "hello", nil, nil)
-	second := NewMessage("second", "hello", nil, nil)
-	third := NewMessage("third", "hello", nil, nil)
+	first := NewMessage("first", "hello", nil, testEmoteSize, testFontSize, nil)
+	second := NewMessage("second", "hello", nil, testEmoteSize, testFontSize, nil)
+	third := NewMessage("third", "hello", nil, testEmoteSize, testFontSize, nil)
 	list.AddMessage(first)
 	list.AddMessage(second)
 	list.AddMessage(third)
@@ -97,14 +97,43 @@ func TestMessageListRendersEmotesOfMessages(t *testing.T) {
 	canvas.SetContent(list)
 	canvas.Resize(fyne.NewSize(300, 200))
 
-	message := NewMessage("author", "hello FeelsDankMan", nil, nil)
+	message := NewMessage("author", "hello FeelsDankMan", nil, testEmoteSize, testFontSize, nil)
 	list.AddMessage(message)
 	list.UpdateEmotes(map[string]*hasherino.Emote{emote.Name: emote})
 
-	if len(message.emotes) != 1 {
-		t.Errorf("expected the message to render 1 emote, got %d", len(message.emotes))
+	if len(message.emoteWidgets) != 1 {
+		t.Errorf("expected the message to render 1 emote, got %d", len(message.emoteWidgets))
 	}
-	if message.emotes[0].Position().X <= 0 {
-		t.Errorf("expected the emote to be laid out after the first word, got %f", message.emotes[0].Position().X)
+	if message.emoteWidgets[0].Position().X <= 0 {
+		t.Errorf("expected the emote to be laid out after the first word, got %f", message.emoteWidgets[0].Position().X)
+	}
+}
+
+func TestMessageListSetStyle(t *testing.T) {
+	app := test.NewApp()
+	defer app.Quit()
+
+	emote := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "FeelsDankMan"}
+	list := NewMessageList()
+	canvas := test.NewCanvas()
+	canvas.SetContent(list)
+	canvas.Resize(fyne.NewSize(300, 200))
+
+	message := NewMessage("author", "hello FeelsDankMan", map[string]*hasherino.Emote{emote.Name: emote}, testEmoteSize, testFontSize, nil)
+	list.AddMessage(message)
+
+	list.SetStyle(fyne.NewSize(36, 36), 20)
+
+	if message.emoteWidgets[0].MinSize() != fyne.NewSize(36, 36) {
+		t.Errorf("expected emote min size 36x36, got %v", message.emoteWidgets[0].MinSize())
+	}
+	if message.Size().Height <= testEmoteSize.Height {
+		t.Errorf("expected the message to grow with the new style, got height %f", message.Size().Height)
+	}
+
+	unchangedEmote := message.emoteWidgets[0]
+	list.SetStyle(fyne.NewSize(36, 36), 20)
+	if message.emoteWidgets[0] != unchangedEmote {
+		t.Error("expected the message not to be rebuilt when the style did not change")
 	}
 }

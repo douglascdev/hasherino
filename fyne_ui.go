@@ -28,10 +28,11 @@ import (
 
 var (
 	callbackMap      = make(map[string]func(hasherino.ChatMessage))
+	messageListMap   = make(map[string]*components.MessageList)
 	defaultEmoteSize = fyne.NewSize(45, 45)
 )
 
-func NewSettingsTabs(hc *hasherino.HasherinoController, w fyne.Window) *container.AppTabs {
+func NewSettingsTabs(hc *hasherino.HasherinoController, w fyne.Window, onStyleChanged func()) *container.AppTabs {
 	// Accounts tab
 	accounts, err := hc.GetAccounts()
 	if err != nil {
@@ -142,6 +143,40 @@ func NewSettingsTabs(hc *hasherino.HasherinoController, w fyne.Window) *containe
 			log.Println(err)
 		}
 	}
+	newSizeSetting := func(label string, value int, set func(int)) *fyne.Container {
+		entry := widget.NewEntry()
+		entry.SetText(strconv.Itoa(value))
+		entry.Validator = func(s string) error {
+			size, err := strconv.Atoi(s)
+			if err != nil {
+				return err
+			}
+			if size <= 0 {
+				return errors.New(label + " must be positive")
+			}
+			return nil
+		}
+		entry.OnChanged = func(s string) {
+			size, err := strconv.Atoi(s)
+			if err != nil || size <= 0 {
+				return
+			}
+			set(size)
+			err = hc.SetSettings(settings)
+			if err != nil {
+				log.Println(err)
+			}
+			onStyleChanged()
+		}
+		return container.NewHBox(widget.NewLabel(label), layout.NewSpacer(), entry)
+	}
+	emoteSizeBox := newSizeSetting("Emote size", settings.EmoteSize, func(size int) {
+		settings.EmoteSize = size
+	})
+	fontSizeBox := newSizeSetting("Font size", settings.FontSize, func(size int) {
+		settings.FontSize = size
+	})
+
 	RobottyURL, err := url.Parse("https://recent-messages.robotty.de/")
 	if err != nil {
 		log.Printf("Could not parse Robotty URL: %v", err)
@@ -189,7 +224,8 @@ func NewSettingsTabs(hc *hasherino.HasherinoController, w fyne.Window) *containe
 	generalBox := container.NewVBox(
 		container.NewHBox(widget.NewLabel("Chat message limit"), layout.NewSpacer(), chatLimitEntry),
 		container.NewHBox(widget.NewLabel("Chat history"), layout.NewSpacer(), historyChoice),
-		widget.NewLabel(""),
+		emoteSizeBox,
+		fontSizeBox,
 		widget.NewLabel(""),
 		widget.NewLabel(""),
 	)
@@ -311,6 +347,7 @@ func NewChatTab(
 ) *container.TabItem {
 	emoteCache := newChannelEmotes(channel, getChannelEmotes)
 	messageList := components.NewMessageList()
+	messageListMap[channel] = messageList
 
 	msgEntry := widget.NewEntry()
 	msgEntry.SetPlaceHolder("Message")
@@ -343,8 +380,10 @@ func NewChatTab(
 			return
 		}
 
+		emoteSize := fyne.NewSize(float32(settings.EmoteSize), float32(settings.EmoteSize))
+		fontSize := float32(settings.FontSize)
 		messageList.SetLimit(settings.ChatMessageLimit)
-		messageList.AddMessage(components.NewMessage(message.Author, message.Text, emoteCache.ByName(), insertEmote))
+		messageList.AddMessage(components.NewMessage(message.Author, message.Text, emoteCache.ByName(), emoteSize, fontSize, insertEmote))
 		messageList.ScrollToBottom()
 	}
 	go func() {
@@ -547,6 +586,18 @@ func main() {
 		return hc.SendMessage(currentTab.Login, message)
 	}
 
+	onStyleChanged := func() {
+		settings, err := hc.GetSettings()
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		emoteSize := fyne.NewSize(float32(settings.EmoteSize), float32(settings.EmoteSize))
+		for _, messageList := range messageListMap {
+			messageList.SetStyle(emoteSize, float32(settings.FontSize))
+		}
+	}
+
 	savedTabs, err := hc.GetTabs()
 	if err == nil {
 		selectedTab, err := hc.GetSelectedTab()
@@ -571,7 +622,7 @@ func main() {
 	components := container.NewBorder(
 		container.NewHBox(
 			widget.NewButtonWithIcon("Settings", theme.SettingsIcon(), func() {
-				dialog.ShowCustom("Settings", "Close", container.NewBorder(nil, nil, nil, nil, NewSettingsTabs(hc, w)), w)
+				dialog.ShowCustom("Settings", "Close", container.NewBorder(nil, nil, nil, nil, NewSettingsTabs(hc, w, onStyleChanged)), w)
 			}),
 			widget.NewButtonWithIcon("Add tab", theme.ContentAddIcon(), func() {
 				entry := widget.NewEntry()
@@ -611,6 +662,7 @@ func main() {
 					return
 				}
 				delete(callbackMap, tab.Login)
+				delete(messageListMap, tab.Login)
 				chatTabs.Remove(chatTabs.Selected())
 			}),
 		),
