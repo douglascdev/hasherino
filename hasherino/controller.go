@@ -38,7 +38,7 @@ func (hc *HasherinoController) New(callbackMap map[string]func(ChatMessage)) (*H
 		return nil, err
 	}
 
-	memDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	memDB, err := openMemDB()
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +49,7 @@ func (hc *HasherinoController) New(callbackMap map[string]func(ChatMessage)) (*H
 	if err != nil {
 		log.Fatalf("failed to create directory: %v", err)
 	}
-	
+
 	// open the SQLite database safely
 	permDB, err := gorm.Open(sqlite.Open(filepath.Join(dataFolder, "gorm.db")), &gorm.Config{})
 	if err != nil {
@@ -75,6 +75,23 @@ func (hc *HasherinoController) New(callbackMap map[string]func(ChatMessage)) (*H
 	}
 	go c.twitchOAuth.ListenForOAuthRedirect(c)
 	return c, nil
+}
+
+// openMemDB opens the in memory database. It is limited to a single
+// connection, because the shared cache of the in memory database locks tables
+// for other connections while they are being written to, which made
+// concurrent reads fail with "database table is locked".
+func openMemDB() (*gorm.DB, error) {
+	memDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	if err != nil {
+		return nil, err
+	}
+	sqlDB, err := memDB.DB()
+	if err != nil {
+		return nil, err
+	}
+	sqlDB.SetMaxOpenConns(1)
+	return memDB, nil
 }
 
 func (hc *HasherinoController) AddAccount(id string, login string, token string) error {
@@ -251,113 +268,97 @@ func GetEmojiJSONMap() (*EmojiJsonMap, error) {
 
 func (hc *HasherinoController) AddTempTabs(channelIds *[]string) error {
 	go func(channelIds *[]string) {
-		err := hc.memDB.Transaction(func(tx *gorm.DB) error {
-			emotes, err, isCached := STVGetGlobalEmotes()
-			// Insert global emotes into tempDB
-			if !isCached {
-				if err != nil {
-					log.Printf("Failed to load global 7tv emotes: %s", err)
-				} else {
-					emoteObjs := []Emote{}
-					for _, emote := range emotes.Data.EmoteSet.Emotes {
-						tempFile, err := os.CreateTemp("", "")
-						if err != nil {
-							log.Printf("Failed to create temp file %s for 7tv emote %s", err, emote.Name)
-							continue
-						}
-						emoteObjs = append(emoteObjs, Emote{
-							Id:        emote.ID,
-							Source:    SevenTV,
-							Name:      emote.Name,
-							Animated:  emote.Data.Animated,
-							ChannelID: nil,
-							OwnerID:   "",
-							Owner:     nil,
-							TempFile:  tempFile.Name(),
-						})
-						tempFile.Close()
-					}
-					log.Println("Loaded " + strconv.Itoa(len(emoteObjs)) + " 7tv global emotes")
-					result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&emoteObjs)
-					if result.Error != nil {
-						log.Printf("Failed to save global 7tv emotes: %s", result.Error)
-					}
-				}
-			}
-			// Insert emoji
-			// emojiData, err := GetEmojiJSONMap()
-			// if err != nil {
-			// 	log.Println("failed to load emoji data: " + err.Error())
-			// } else {
-			//
-			// }
+		emoteObjs := []Emote{}
 
-			// Insert channel 7tv emotes
-			stvUsers := make(map[string]*STVUserJson)
-			mutex := sync.Mutex{}
-			wg := sync.WaitGroup{}
-			for _, channelId := range *channelIds {
-				wg.Add(1)
-				go func(channelId string) {
-					defer wg.Done()
-					stvUser, err := STVGetUser(channelId)
+		globalEmotes, err, isCached := STVGetGlobalEmotes()
+		if !isCached {
+			if err != nil {
+				log.Printf("Failed to load global 7tv emotes: %s", err)
+			} else {
+				for _, emote := range globalEmotes.Data.EmoteSet.Emotes {
+					tempFile, err := os.CreateTemp("", "")
 					if err != nil {
-						log.Printf("Failed to load 7tv user emotes: %s", err)
-					} else {
-						mutex.Lock()
-						stvUsers[channelId] = stvUser
-						mutex.Unlock()
-					}
-				}(channelId)
-			}
-			wg.Wait()
-
-			if len(stvUsers) > 0 {
-				for channelId, stvUser := range stvUsers {
-					if channelId == "" {
+						log.Printf("Failed to create temp file %s for 7tv emote %s", err, emote.Name)
 						continue
 					}
+					emoteObjs = append(emoteObjs, Emote{
+						Id:        emote.ID,
+						Source:    SevenTV,
+						Name:      emote.Name,
+						Animated:  emote.Data.Animated,
+						ChannelID: nil,
+						OwnerID:   "",
+						Owner:     nil,
+						TempFile:  tempFile.Name(),
+					})
+					tempFile.Close()
+				}
+				log.Println("Loaded " + strconv.Itoa(len(emoteObjs)) + " 7tv global emotes")
+			}
+		}
 
-					emoteObjs := []Emote{}
-					if len(stvUser.Data.UserByConnection.EmoteSets) > 0 {
-						emoteSet, err := stvUser.DefaultEmoteSet()
-						if err != nil {
-							log.Printf("Failed to load default 7tv emote set: %s", err)
-							continue
-						}
-						for _, emote := range emoteSet.Emotes {
-							tempFile, err := os.CreateTemp("", "")
-							if err != nil {
-								log.Printf("Failed to create temp file %s for 7tv emote %s", err, emote.Data.Name)
-								continue
-							}
-							e := Emote{
-								Id:        emote.Data.ID,
-								Source:    SevenTV,
-								Name:      emote.Name,
-								Animated:  emote.Data.Animated,
-								ChannelID: &channelId,
-								OwnerID:   "",
-								Owner:     nil,
-								TempFile:  tempFile.Name(),
-							}
-							tempFile.Close()
-							emoteObjs = append(emoteObjs, e)
-						}
+		stvUsers := make(map[string]*STVUserJson)
+		mutex := sync.Mutex{}
+		wg := sync.WaitGroup{}
+		for _, channelId := range *channelIds {
+			wg.Add(1)
+			go func(channelId string) {
+				defer wg.Done()
+				stvUser, err := STVGetUser(channelId)
+				if err != nil {
+					log.Printf("Failed to load 7tv user emotes: %s", err)
+				} else {
+					mutex.Lock()
+					stvUsers[channelId] = stvUser
+					mutex.Unlock()
+				}
+			}(channelId)
+		}
+		wg.Wait()
+
+		for channelId, stvUser := range stvUsers {
+			if channelId == "" {
+				continue
+			}
+
+			channelEmotes := []Emote{}
+			if len(stvUser.Data.UserByConnection.EmoteSets) > 0 {
+				emoteSet, err := stvUser.DefaultEmoteSet()
+				if err != nil {
+					log.Printf("Failed to load default 7tv emote set: %s", err)
+					continue
+				}
+				for _, emote := range emoteSet.Emotes {
+					tempFile, err := os.CreateTemp("", "")
+					if err != nil {
+						log.Printf("Failed to create temp file %s for 7tv emote %s", err, emote.Data.Name)
+						continue
 					}
-					log.Println("Loaded " + strconv.Itoa(len(emoteObjs)) + " 7tv user emotes for " + channelId)
-					if len(emoteObjs) > 0 {
-						result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&emoteObjs)
-						if result.Error != nil {
-							return result.Error
-						}
-					}
+					channelEmotes = append(channelEmotes, Emote{
+						Id:        emote.Data.ID,
+						Source:    SevenTV,
+						Name:      emote.Name,
+						Animated:  emote.Data.Animated,
+						ChannelID: &channelId,
+						OwnerID:   "",
+						Owner:     nil,
+						TempFile:  tempFile.Name(),
+					})
+					tempFile.Close()
 				}
 			}
-			return nil
+			log.Println("Loaded " + strconv.Itoa(len(channelEmotes)) + " 7tv user emotes for " + channelId)
+			emoteObjs = append(emoteObjs, channelEmotes...)
+		}
+
+		if len(emoteObjs) == 0 {
+			return
+		}
+		err = hc.memDB.Transaction(func(tx *gorm.DB) error {
+			return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&emoteObjs).Error
 		})
 		if err != nil {
-			log.Printf("Failed to add temp tabs: %s", err)
+			log.Printf("Failed to save 7tv emotes: %s", err)
 		}
 	}(channelIds)
 
@@ -403,6 +404,29 @@ func (hc *HasherinoController) GetEmotes(search string) ([]*Emote, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	return emotes, nil
+}
+
+// GetChannelEmotes returns every emote that can be rendered in the given channel,
+// regardless of the currently selected tab.
+func (hc *HasherinoController) GetChannelEmotes(channel string) ([]*Emote, error) {
+	tab := &Tab{}
+	result := hc.permDB.Take(&tab, "Login = ?", channel)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	activeAccount := &Account{}
+	result = hc.permDB.Take(&activeAccount, "Active = ?", true)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+
+	emotes := []*Emote{}
+	query := "(owner_id = ? OR owner_id = '') AND (channel_id = ? OR channel_id IS NULL)"
+	result = hc.memDB.Where(query, activeAccount.Id, tab.Id).Find(&emotes)
+	if result.Error != nil {
+		return nil, result.Error
 	}
 	return emotes, nil
 }

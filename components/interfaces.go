@@ -8,3 +8,9 @@ type LazyLoadedWidget interface {
 	LazyLoad() error
 	LazyUnload() error
 }
+
+type EmoteWidget interface {
+	LazyLoadedWidget
+
+	SetMinSize(fyne.Size)
+}

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -230,44 +231,121 @@ func NewEmoteCanvasObject(emote *hasherino.Emote) (*fyne.CanvasObject, error) {
 	return &imgContainer, nil
 }
 
+// channelEmotes caches the emotes that can be rendered in a channel, so that
+// incoming messages don't have to query the database for every word.
+type channelEmotes struct {
+	channel   string
+	getEmotes func(string) ([]*hasherino.Emote, error)
+
+	mutex     sync.RWMutex
+	byName    map[string]*hasherino.Emote
+	fetchedAt time.Time
+}
+
+const (
+	emoteCacheLifetime = 10 * time.Second
+	emotePollInterval  = 2 * time.Second
+	emotePollAttempts  = 30
+)
+
+func newChannelEmotes(channel string, getEmotes func(string) ([]*hasherino.Emote, error)) *channelEmotes {
+	return &channelEmotes{
+		channel:   channel,
+		getEmotes: getEmotes,
+		byName:    make(map[string]*hasherino.Emote),
+	}
+}
+
+// Refresh reloads the emotes of the channel when the cached ones are outdated.
+// It returns true when the emotes were reloaded.
+func (c *channelEmotes) Refresh() (bool, error) {
+	return c.refresh(false)
+}
+
+// ForceRefresh reloads the emotes of the channel, no matter how fresh the
+// cached ones are.
+func (c *channelEmotes) ForceRefresh() (bool, error) {
+	return c.refresh(true)
+}
+
+func (c *channelEmotes) refresh(force bool) (bool, error) {
+	if !force {
+		c.mutex.RLock()
+		fresh := time.Since(c.fetchedAt) < emoteCacheLifetime
+		c.mutex.RUnlock()
+		if fresh {
+			return false, nil
+		}
+	}
+
+	emotes, err := c.getEmotes(c.channel)
+
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.fetchedAt = time.Now()
+	if err != nil {
+		return false, err
+	}
+
+	byName := make(map[string]*hasherino.Emote, len(emotes))
+	for _, emote := range emotes {
+		byName[emote.Name] = emote
+	}
+	c.byName = byName
+	return true, nil
+}
+
+func (c *channelEmotes) ByName() map[string]*hasherino.Emote {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return c.byName
+}
+
 func NewChatTab(
 	channel string,
 	sendMsg func(string) error,
 	getEmotes func(string) ([]*hasherino.Emote, error),
+	getChannelEmotes func(string) ([]*hasherino.Emote, error),
 	window fyne.Window,
 	settingsFunc func() (*hasherino.AppSettings, error),
 ) *container.TabItem {
-	var data []string = []string{}
-	messageList := widget.NewList(
-		func() int {
-			return len(data)
-		},
-		func() fyne.CanvasObject {
-			label := widget.NewLabel("template")
-			label.Wrapping = fyne.TextWrapWord
-			return label
-		},
-		func(i widget.ListItemID, o fyne.CanvasObject) {
-			o.(*widget.Label).SetText(data[i])
-		})
+	emoteCache := newChannelEmotes(channel, getChannelEmotes)
+	messageList := components.NewMessageList()
+
+	msgEntry := widget.NewEntry()
+	msgEntry.SetPlaceHolder("Message")
+	msgEntry.Validator = func(s string) error {
+		if len(s) > 500 {
+			return errors.New("Message too long")
+		}
+		return nil
+	}
+	insertEmote := func(text string) error {
+		msgEntry.SetText(msgEntry.Text + text)
+		return nil
+	}
+
 	callbackMap[channel] = func(message hasherino.ChatMessage) {
 		if message.Command != "PRIVMSG" {
 			return
 		}
-		text := message.Author + ": " + message.Text
+
+		reloaded, err := emoteCache.Refresh()
+		if err != nil {
+			log.Println(err)
+		} else if reloaded {
+			messageList.UpdateEmotes(emoteCache.ByName())
+		}
 
 		settings, err := settingsFunc()
 		if err != nil {
 			log.Println(err)
 			return
 		}
-		if len(data) >= settings.ChatMessageLimit {
-			data = append(data[1:], text)
-		} else {
-			data = append(data, text)
-		}
+
+		messageList.SetLimit(settings.ChatMessageLimit)
+		messageList.AddMessage(components.NewMessage(message.Author, message.Text, emoteCache.ByName(), insertEmote))
 		messageList.ScrollToBottom()
-		messageList.Refresh()
 	}
 	go func() {
 		settings, err := settingsFunc()
@@ -292,14 +370,24 @@ func NewChatTab(
 			callback(msg)
 		}
 	}()
-	msgEntry := widget.NewEntry()
-	msgEntry.SetPlaceHolder("Message")
-	msgEntry.Validator = func(s string) error {
-		if len(s) > 500 {
-			return errors.New("Message too long")
+	go func() {
+		// The emotes of the channel are loaded in the background and usually
+		// finish after the chat history is rendered, so keep refreshing them
+		// until they are available and give the messages their emotes.
+		for range emotePollAttempts {
+			time.Sleep(emotePollInterval)
+			_, err := emoteCache.ForceRefresh()
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+			if len(emoteCache.ByName()) == 0 {
+				continue
+			}
+			messageList.UpdateEmotes(emoteCache.ByName())
+			return
 		}
-		return nil
-	}
+	}()
 	msgEntry.OnSubmitted = func(text string) {
 		err := msgEntry.Validate()
 		if err != nil {
@@ -315,7 +403,6 @@ func NewChatTab(
 
 		msgEntry.SetText("")
 		messageList.ScrollToBottom()
-		messageList.Refresh()
 	}
 	content := container.NewBorder(nil, container.NewBorder(nil, nil, nil, widget.NewButton("😃", func() {
 		newWindow := fyne.CurrentApp().NewWindow("Select emote")
@@ -467,7 +554,7 @@ func main() {
 
 		for _, tab := range savedTabs {
 			tabIds = append(tabIds, tab.Id)
-			newTab := NewChatTab(tab.Login, sendMessage, hc.GetEmotes, w, hc.GetSettings)
+			newTab := NewChatTab(tab.Login, sendMessage, hc.GetEmotes, hc.GetChannelEmotes, w, hc.GetSettings)
 			chatTabs.Append(newTab)
 			if err == nil && selectedTab.Login == tab.Login {
 				chatTabs.Select(newTab)
@@ -498,7 +585,7 @@ func main() {
 						if err != nil {
 							dialog.ShowError(err, w)
 						} else {
-							chatTabs.Append(NewChatTab(entry.Text, sendMessage, hc.GetEmotes, w, hc.GetSettings))
+							chatTabs.Append(NewChatTab(entry.Text, sendMessage, hc.GetEmotes, hc.GetChannelEmotes, w, hc.GetSettings))
 							newTabDialog.Hide()
 						}
 					}
