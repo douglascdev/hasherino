@@ -23,7 +23,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev gcc-mingw-w64 libx11-dev libxcursor-dev libxrandr-dev libinerama-dev libxi-dev libxxf86vm-dev
+        sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev gcc-mingw-w64 libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev libxxf86vm-dev
 
     - name: Linux build
       run: go build -v -ldflags "-s -w" -o hasherino-linux
