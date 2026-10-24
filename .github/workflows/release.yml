@@ -31,8 +31,8 @@ jobs:
       with:
         name: hasherino
         path: |
-          fyne-cross/dist/linux-amd64/hasherino
-          fyne-cross/dist/windows-amd64/hasherino.exe
+          fyne-cross/dist/linux-amd64/**
+          fyne-cross/dist/windows-amd64/**
 
   release:
     runs-on: ubuntu-latest
