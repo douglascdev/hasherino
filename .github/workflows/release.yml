@@ -21,10 +21,10 @@ jobs:
       run: go install github.com/fyne-io/fyne-cross@latest
 
     - name: Build Linux Binary
-      run: fyne-cross linux -arch=amd64 -app-name hasherino -ldflags="-s -w"
+      run: fyne-cross linux -arch=amd64 -ldflags="-s -w"
 
     - name: Build Windows Binary
-      run: fyne-cross windows -arch=amd64 -app-name hasherino -ldflags="-s -w"
+      run: fyne-cross windows -arch=amd64 -ldflags="-s -w"
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
