@@ -31,8 +31,7 @@ jobs:
       with:
         name: hasherino
         path: |
-          fyne-cross/dist/linux-amd64/*
-          fyne-cross/dist/windows-amd64/*
+          fyne-cross/dist/
 
   release:
     runs-on: ubuntu-latest
@@ -41,13 +40,11 @@ jobs:
       contents: write
 
     steps:
-    - uses: actions/checkout@v4
-
     - name: Download artifacts
       uses: actions/download-artifact@v4
       with:
         name: hasherino
-        path: .
+        path: clean-dist
     
     - name: Release
       uses: softprops/action-gh-release@v2
@@ -56,5 +53,5 @@ jobs:
         token: ${{ secrets.GITHUB_TOKEN }}
         body_path: CHANGELOG.md
         files: |
-          ./*
-
+          clean-dist/linux-amd64/*
+          clean-dist/windows-amd64/*
