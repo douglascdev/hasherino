@@ -15,28 +15,30 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.26'
+        go-version: '1.22'
 
     - name: Install fyne-cross
       run: go install github.com/fyne-io/fyne-cross@latest
 
     - name: Build Linux Binary
-      run: fyne-cross linux -arch=amd64 -app-id com.hashysoftware.hasherino 
+      run: fyne-cross linux -arch=amd64 -app-id com.hashysoftware.hasherino
 
     - name: Build Windows Binary
-      run: fyne-cross windows -arch=amd64 -app-id com.hashysoftware.hasherino 
+      run: fyne-cross windows -arch=amd64 -app-id com.hashysoftware.hasherino
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
         name: hasherino
         path: |
-          fyne-cross/dist/linux-amd64/**
-          fyne-cross/dist/windows-amd64/**
+          fyne-cross/dist/linux-amd64/*
+          fyne-cross/dist/windows-amd64/*
 
   release:
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      contents: write
 
     steps:
     - uses: actions/checkout@v4
@@ -45,7 +47,7 @@ jobs:
       uses: actions/download-artifact@v4
       with:
         name: hasherino
-        path: artifacts
+        path: .
     
     - name: Release
       uses: softprops/action-gh-release@v2
@@ -54,5 +56,5 @@ jobs:
         token: ${{ secrets.GITHUB_TOKEN }}
         body_path: CHANGELOG.md
         files: |
-          artifacts/*
+          ./*
 
