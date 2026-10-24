@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -15,17 +16,21 @@ import (
 	"github.com/Hashy-Software/hasherino-go/hasherino"
 )
 
+const messageTimeFormat = "15:04"
+
 // Message renders a single chat message, replacing the names of known emotes
 // with their emote widget and displaying the rest as text.
 type Message struct {
 	widget.BaseWidget
 
-	author        string
-	text          string
-	onEmoteTapped func(string) error
-	emoteSize     fyne.Size
-	fontSize      float32
-	content       *fyne.Container
+	author          string
+	text            string
+	timestamp       time.Time
+	onEmoteTapped   func(string) error
+	emoteSize       fyne.Size
+	fontSize        float32
+	showMessageTime bool
+	content         *fyne.Container
 
 	lock         sync.Mutex
 	emotes       map[string]*hasherino.Emote
@@ -34,15 +39,17 @@ type Message struct {
 	emotesLoaded bool
 }
 
-func NewMessage(author string, text string, emotes map[string]*hasherino.Emote, emoteSize fyne.Size, fontSize float32, onEmoteTapped func(string) error) *Message {
+func NewMessage(author string, text string, timestamp time.Time, emotes map[string]*hasherino.Emote, emoteSize fyne.Size, fontSize float32, showMessageTime bool, onEmoteTapped func(string) error) *Message {
 	message := &Message{
-		author:        author,
-		text:          text,
-		onEmoteTapped: onEmoteTapped,
-		emoteSize:     emoteSize,
-		fontSize:      fontSize,
-		emotes:        emotes,
-		content:       container.New(newMessageLayout(fontSize)),
+		author:          author,
+		text:            text,
+		timestamp:       timestamp,
+		onEmoteTapped:   onEmoteTapped,
+		emoteSize:       emoteSize,
+		fontSize:        fontSize,
+		showMessageTime: showMessageTime,
+		emotes:          emotes,
+		content:         container.New(newMessageLayout(fontSize)),
 	}
 	message.ExtendBaseWidget(message)
 	message.emoteNames = message.matchedEmoteNames(emotes)
@@ -86,11 +93,11 @@ func (m *Message) SetEmotes(emotes map[string]*hasherino.Emote) bool {
 	return true
 }
 
-// SetStyle rebuilds the message if its emote or font size changed.
+// SetStyle rebuilds the message if settings like emote or font size changed.
 // It returns true when the message was rebuilt.
-func (m *Message) SetStyle(emoteSize fyne.Size, fontSize float32) bool {
+func (m *Message) SetStyle(emoteSize fyne.Size, fontSize float32, showMessageTime bool) bool {
 	m.lock.Lock()
-	if m.emoteSize == emoteSize && m.fontSize == fontSize {
+	if m.emoteSize == emoteSize && m.fontSize == fontSize && m.showMessageTime == showMessageTime {
 		m.lock.Unlock()
 		return false
 	}
@@ -99,6 +106,7 @@ func (m *Message) SetStyle(emoteSize fyne.Size, fontSize float32) bool {
 	reload := m.emotesLoaded
 	m.emoteSize = emoteSize
 	m.fontSize = fontSize
+	m.showMessageTime = showMessageTime
 	m.emoteWidgets = nil
 	m.emotesLoaded = false
 	m.lock.Unlock()
@@ -175,7 +183,11 @@ func (m *Message) matchedEmoteNames(emotes map[string]*hasherino.Emote) []string
 }
 
 func (m *Message) render(emotes map[string]*hasherino.Emote) {
-	objects := []fyne.CanvasObject{newMessageText(m.author+":", fyne.TextStyle{Bold: true}, m.fontSize)}
+	objects := []fyne.CanvasObject{}
+	if m.showMessageTime {
+		objects = append(objects, newMessageText(m.timestamp.Format(messageTimeFormat), fyne.TextStyle{}, m.fontSize))
+	}
+	objects = append(objects, newMessageText(m.author+":", fyne.TextStyle{Bold: true}, m.fontSize))
 	emoteWidgets := []EmoteWidget{}
 
 	for _, word := range strings.Fields(m.text) {

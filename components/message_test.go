@@ -2,6 +2,7 @@ package components
 
 import (
 	"testing"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -13,8 +14,9 @@ import (
 )
 
 var (
-	testEmoteSize = fyne.NewSize(28, 28)
-	testFontSize  = theme.TextSize()
+	testEmoteSize   = fyne.NewSize(28, 28)
+	testFontSize    = theme.TextSize()
+	testMessageTime = time.Unix(0, 0).UTC()
 )
 
 func TestFlowLayoutKeepsObjectsOnOneLineWhenTheyFit(t *testing.T) {
@@ -85,7 +87,7 @@ func TestMessageRendersTextAndEmotes(t *testing.T) {
 
 	emote := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "FeelsDankMan"}
 	emotes := map[string]*hasherino.Emote{emote.Name: emote}
-	message := NewMessage("author", "hello FeelsDankMan world", emotes, testEmoteSize, testFontSize, nil)
+	message := NewMessage("author", "hello FeelsDankMan world", testMessageTime, emotes, testEmoteSize, testFontSize, false, nil)
 
 	emoteWidgets := 0
 	words := 0
@@ -117,7 +119,7 @@ func TestMessageSetEmotesOnlyRebuildsOnChange(t *testing.T) {
 	defer app.Quit()
 
 	emote := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "FeelsDankMan"}
-	message := NewMessage("author", "hello FeelsDankMan", nil, testEmoteSize, testFontSize, nil)
+	message := NewMessage("author", "hello FeelsDankMan", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
 
 	if len(message.emoteWidgets) != 0 {
 		t.Errorf("expected no emotes to be rendered, got %d", len(message.emoteWidgets))
@@ -139,26 +141,66 @@ func TestMessageSetStyleOnlyRebuildsOnChange(t *testing.T) {
 
 	emote := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "FeelsDankMan"}
 	emotes := map[string]*hasherino.Emote{emote.Name: emote}
-	message := NewMessage("author", "hello FeelsDankMan", emotes, testEmoteSize, testFontSize, nil)
+	message := NewMessage("author", "hello FeelsDankMan", testMessageTime, emotes, testEmoteSize, testFontSize, false, nil)
 
-	if message.SetStyle(testEmoteSize, testFontSize) {
+	if message.SetStyle(testEmoteSize, testFontSize, false) {
 		t.Error("expected message not to be rebuilt when the style did not change")
 	}
 
 	biggerEmoteSize := fyne.NewSize(36, 36)
-	if !message.SetStyle(biggerEmoteSize, testFontSize) {
+	if !message.SetStyle(biggerEmoteSize, testFontSize, false) {
 		t.Error("expected message to be rebuilt when the emote size changed")
 	}
 	if message.emoteWidgets[0].MinSize() != biggerEmoteSize {
 		t.Errorf("expected emote min size %v, got %v", biggerEmoteSize, message.emoteWidgets[0].MinSize())
 	}
 
-	if !message.SetStyle(biggerEmoteSize, 20) {
+	if !message.SetStyle(biggerEmoteSize, 20, false) {
 		t.Error("expected message to be rebuilt when the font size changed")
 	}
 	author := message.content.Objects[0].(*canvas.Text)
 	if author.TextSize != 20 {
 		t.Errorf("expected author text size 20, got %f", author.TextSize)
+	}
+
+	if !message.SetStyle(biggerEmoteSize, 20, true) {
+		t.Error("expected message to be rebuilt when show message time changed")
+	}
+	timeText := message.content.Objects[0].(*canvas.Text)
+	if timeText.TextStyle.Bold {
+		t.Error("expected the message time to be non-bold")
+	}
+	if timeText.Text != "[00:00]" {
+		t.Errorf("expected the message time [00:00], got %q", timeText.Text)
+	}
+}
+
+func TestMessageRendersTimeBeforeAuthorWhenEnabled(t *testing.T) {
+	app := test.NewApp()
+	defer app.Quit()
+
+	timestamp := time.Unix(3600*15+120, 0).UTC()
+	message := NewMessage("author", "hello", timestamp, nil, testEmoteSize, testFontSize, true, nil)
+
+	if len(message.content.Objects) != 3 {
+		t.Fatalf("expected the message time, author and word, got %d objects", len(message.content.Objects))
+	}
+	timeText, ok := message.content.Objects[0].(*canvas.Text)
+	if !ok {
+		t.Fatalf("expected the first object to be the message time, got %T", message.content.Objects[0])
+	}
+	if timeText.Text != "[15:02]" {
+		t.Errorf("expected the message time [15:02], got %q", timeText.Text)
+	}
+	if timeText.TextStyle.Bold {
+		t.Error("expected the message time to be non-bold")
+	}
+	if timeText.TextSize != testFontSize {
+		t.Errorf("expected the message time to use font size %f, got %f", testFontSize, timeText.TextSize)
+	}
+	author := message.content.Objects[1].(*canvas.Text)
+	if author.Text != "author:" || !author.TextStyle.Bold {
+		t.Errorf("expected a bold author after the message time, got %q", author.Text)
 	}
 }
 
@@ -166,7 +208,7 @@ func TestMessageWrapsWhenNarrow(t *testing.T) {
 	app := test.NewApp()
 	defer app.Quit()
 
-	message := NewMessage("author", "a fairly long message that has to wrap over multiple lines", nil, testEmoteSize, testFontSize, nil)
+	message := NewMessage("author", "a fairly long message that has to wrap over multiple lines", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
 
 	message.Resize(fyne.NewSize(500, 10))
 	wide := message.MinSize().Height

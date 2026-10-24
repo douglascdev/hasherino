@@ -72,6 +72,7 @@ func (hc *HasherinoController) New(callbackMap map[string]func(ChatMessage)) (*H
 		result = permDB.Create(&AppSettings{
 			ChatMessageLimit: 100,
 			ChatHistory:      false,
+			ShowMessageTime:  DefaultShowMessageTime,
 			EmoteSize:        DefaultEmoteSize,
 			FontSize:         DefaultFontSize,
 		})
@@ -88,6 +89,8 @@ func (hc *HasherinoController) New(callbackMap map[string]func(ChatMessage)) (*H
 		settings.FontSize = DefaultFontSize
 	}
 	if missingDefaults {
+		settings.ShowMessageTime = DefaultShowMessageTime
+
 		if err := permDB.Save(settings).Error; err != nil {
 			log.Println("Failed to save default settings:", err)
 		}

@@ -86,12 +86,12 @@ func (l *MessageList) UpdateEmotes(emotes map[string]*hasherino.Emote) {
 	}
 }
 
-// SetStyle re-renders the messages whose emote or font size changed, for
+// SetStyle re-renders the messages whose style settings changed, for
 // example because the user changed the settings.
-func (l *MessageList) SetStyle(emoteSize fyne.Size, fontSize float32) {
+func (l *MessageList) SetStyle(emoteSize fyne.Size, fontSize float32, showMessageTime bool) {
 	changed := false
 	for _, message := range l.Messages() {
-		if message.SetStyle(emoteSize, fontSize) {
+		if message.SetStyle(emoteSize, fontSize, showMessageTime) {
 			changed = true
 		}
 	}

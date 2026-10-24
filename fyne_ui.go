@@ -177,6 +177,18 @@ func NewSettingsTabs(hc *hasherino.HasherinoController, w fyne.Window, onStyleCh
 		settings.FontSize = size
 	})
 
+	showMessageTime := widget.NewCheck("", func(b bool) {})
+	showMessageTime.Checked = settings.ShowMessageTime
+	showMessageTime.OnChanged = func(b bool) {
+		settings.ShowMessageTime = b
+		err = hc.SetSettings(settings)
+		if err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+		onStyleChanged()
+	}
+
 	RobottyURL, err := url.Parse("https://recent-messages.robotty.de/")
 	if err != nil {
 		log.Printf("Could not parse Robotty URL: %v", err)
@@ -224,6 +236,7 @@ func NewSettingsTabs(hc *hasherino.HasherinoController, w fyne.Window, onStyleCh
 	generalBox := container.NewVBox(
 		container.NewHBox(widget.NewLabel("Chat message limit"), layout.NewSpacer(), chatLimitEntry),
 		container.NewHBox(widget.NewLabel("Chat history"), layout.NewSpacer(), historyChoice),
+		container.NewHBox(widget.NewLabel("Show message time"), layout.NewSpacer(), showMessageTime),
 		emoteSizeBox,
 		fontSizeBox,
 		widget.NewLabel(""),
@@ -383,7 +396,7 @@ func NewChatTab(
 		emoteSize := fyne.NewSize(float32(settings.EmoteSize), float32(settings.EmoteSize))
 		fontSize := float32(settings.FontSize)
 		messageList.SetLimit(settings.ChatMessageLimit)
-		messageList.AddMessage(components.NewMessage(message.Author, message.Text, emoteCache.ByName(), emoteSize, fontSize, insertEmote))
+		messageList.AddMessage(components.NewMessage(message.Author, message.Text, message.Time, emoteCache.ByName(), emoteSize, fontSize, settings.ShowMessageTime, insertEmote))
 		messageList.ScrollToBottom()
 	}
 	go func() {
@@ -595,7 +608,7 @@ func main() {
 		}
 		emoteSize := fyne.NewSize(float32(settings.EmoteSize), float32(settings.EmoteSize))
 		for _, messageList := range messageListMap {
-			messageList.SetStyle(emoteSize, float32(settings.FontSize))
+			messageList.SetStyle(emoteSize, float32(settings.FontSize), settings.ShowMessageTime)
 		}
 	}
 
