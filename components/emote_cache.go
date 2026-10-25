@@ -2,6 +2,7 @@ package components
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"image"
 	"image/gif"
@@ -86,18 +87,18 @@ type emoteCache struct {
 // emoteLoad is an in-flight emote load that concurrent callers of the same
 // emote wait for.
 type emoteLoad struct {
-	done  chan struct{}
-	image image.Image
-	gif   *gif.GIF
-	err   error
+	done      chan struct{}
+	image     image.Image
+	animation *gifAnimation
+	err       error
 }
 
 // decodedEmote is a decoded emote kept in memory.
 type decodedEmote struct {
-	image    image.Image
-	gif      *gif.GIF
-	bytes    int64
-	lastUsed time.Time
+	image     image.Image
+	animation *gifAnimation
+	bytes     int64
+	lastUsed  time.Time
 }
 
 // getEmoteCache returns the emote cache shared by all emote widgets.
@@ -161,70 +162,77 @@ func (c *emoteCache) Image(emote *hasherino.Emote) (image.Image, error) {
 	return img, nil
 }
 
-// Gif returns the decoded gif of the emote, downloading and caching it if
-// necessary.
-func (c *emoteCache) Gif(emote *hasherino.Emote) (*gif.GIF, error) {
-	_, gif, err := c.load(emote)
+// Gif returns the animation of the emote with every frame pre-composited,
+// downloading and caching it if necessary.
+func (c *emoteCache) Gif(emote *hasherino.Emote) (*gifAnimation, error) {
+	_, animation, err := c.load(emote)
 	if err != nil {
 		return nil, err
 	}
-	if gif == nil {
+	if animation == nil {
 		return nil, fmt.Errorf("emote %s did not decode to an animated gif", emote.Name)
 	}
-	return gif, nil
+	return animation, nil
 }
 
 // load returns the decoded emote, downloading and caching it if necessary.
 // Concurrent loads of the same emote are deduplicated into one download and
 // decode. Failed loads are not cached, so they are retried on the next call.
-func (c *emoteCache) load(emote *hasherino.Emote) (image.Image, *gif.GIF, error) {
+func (c *emoteCache) load(emote *hasherino.Emote) (image.Image, *gifAnimation, error) {
 	key := emoteCacheKey(emote)
 
 	c.mu.Lock()
 	if decoded, ok := c.decoded[key]; ok {
 		decoded.lastUsed = time.Now()
 		c.mu.Unlock()
-		return decoded.image, decoded.gif, nil
+		return decoded.image, decoded.animation, nil
 	}
 	if load, ok := c.loading[key]; ok {
 		c.mu.Unlock()
 		<-load.done
-		return load.image, load.gif, load.err
+		return load.image, load.animation, load.err
 	}
 	load := &emoteLoad{done: make(chan struct{})}
 	c.loading[key] = load
 	c.mu.Unlock()
 
-	img, gif, err := c.fetchAndDecode(emote)
+	img, animation, err := c.fetchAndDecode(emote)
 
-	load.image, load.gif, load.err = img, gif, err
+	load.image, load.animation, load.err = img, animation, err
 	close(load.done)
 
 	c.mu.Lock()
 	delete(c.loading, key)
 	if err == nil {
-		entry := &decodedEmote{image: img, gif: gif, bytes: decodedSize(img, gif), lastUsed: time.Now()}
+		entry := &decodedEmote{image: img, animation: animation, bytes: decodedSize(img, animation), lastUsed: time.Now()}
 		c.decoded[key] = entry
 		c.used += entry.bytes
 		c.evictLocked()
 	}
 	c.mu.Unlock()
 
-	return img, gif, err
+	return img, animation, err
 }
 
 // fetchAndDecode fetches the file of the emote and decodes it according to
 // its animated flag.
-func (c *emoteCache) fetchAndDecode(emote *hasherino.Emote) (image.Image, *gif.GIF, error) {
+func (c *emoteCache) fetchAndDecode(emote *hasherino.Emote) (image.Image, *gifAnimation, error) {
 	data, fromDisk, err := c.emoteFile(emote)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	var img image.Image
-	var src *gif.GIF
+	var animation *gifAnimation
 	if emote.Animated {
+		var src *gif.GIF
 		src, err = gif.DecodeAll(bytes.NewReader(data))
+		if err == nil {
+			animation = buildAnimation(src)
+			if animation == nil {
+				err = errors.New("gif has no frames")
+			}
+		}
 	} else {
 		img, err = webp.Decode(bytes.NewReader(data))
 	}
@@ -236,7 +244,7 @@ func (c *emoteCache) fetchAndDecode(emote *hasherino.Emote) (image.Image, *gif.G
 		}
 		return nil, nil, err
 	}
-	return img, src, nil
+	return img, animation, nil
 }
 
 // emoteFile returns the raw file of the emote and whether it was read from the
@@ -313,19 +321,16 @@ func (c *emoteCache) evictLocked() {
 }
 
 // decodedSize estimates how many bytes of memory the decoded emote occupies.
-func decodedSize(img image.Image, gif *gif.GIF) int64 {
+func decodedSize(img image.Image, animation *gifAnimation) int64 {
 	if img != nil {
 		bounds := img.Bounds()
 		return int64(bounds.Dx()) * int64(bounds.Dy()) * 4
 	}
 	var size int64
-	if gif != nil {
-		for _, frame := range gif.Image {
+	if animation != nil {
+		for _, frame := range animation.frames {
 			bounds := frame.Bounds()
-			size += int64(bounds.Dx()) * int64(bounds.Dy())
-			if frame.Palette != nil {
-				size += int64(len(frame.Palette)) * 4
-			}
+			size += int64(bounds.Dx()) * int64(bounds.Dy()) * 4
 		}
 	}
 	return size

@@ -32,7 +32,7 @@ func NewMessageList() *MessageList {
 	list.ExtendBaseWidget(list)
 	list.scroll = container.NewVScroll(list.content)
 	list.scroll.OnScrolled = func(_ fyne.Position) {
-		list.updateVisibleEmotes()
+		list.UpdateVisibleEmotes()
 	}
 	return list
 }
@@ -68,7 +68,7 @@ func (l *MessageList) AddMessage(message *Message) {
 	}
 
 	l.Refresh()
-	l.updateVisibleEmotes()
+	l.UpdateVisibleEmotes()
 }
 
 // UpdateEmotes re-renders the messages whose emotes changed, for example
@@ -82,7 +82,7 @@ func (l *MessageList) UpdateEmotes(emotes map[string]*hasherino.Emote) {
 	}
 	if changed {
 		l.Refresh()
-		l.updateVisibleEmotes()
+		l.UpdateVisibleEmotes()
 	}
 }
 
@@ -97,7 +97,7 @@ func (l *MessageList) SetStyle(emoteSize fyne.Size, fontSize float32, showMessag
 	}
 	if changed {
 		l.Refresh()
-		l.updateVisibleEmotes()
+		l.UpdateVisibleEmotes()
 	}
 }
 
@@ -112,10 +112,12 @@ func (l *MessageList) Messages() []*Message {
 
 func (l *MessageList) ScrollToBottom() {
 	l.scroll.ScrollToBottom()
-	l.updateVisibleEmotes()
+	l.UpdateVisibleEmotes()
 }
 
-func (l *MessageList) updateVisibleEmotes() {
+// UpdateVisibleEmotes loads the emotes of the messages that are in view and
+// unloads the emotes of the messages that are out of view.
+func (l *MessageList) UpdateVisibleEmotes() {
 	viewport := l.scroll.Size()
 	offset := l.scroll.Offset
 	for _, message := range l.Messages() {
@@ -128,6 +130,14 @@ func (l *MessageList) updateVisibleEmotes() {
 		} else {
 			message.UnloadEmotes()
 		}
+	}
+}
+
+// UnloadAllEmotes unloads the emotes of every message, for example when the
+// list becomes hidden, so its emotes don't animate in the background.
+func (l *MessageList) UnloadAllEmotes() {
+	for _, message := range l.Messages() {
+		message.UnloadEmotes()
 	}
 }
 

@@ -614,6 +614,15 @@ func main() {
 		if err := hc.SetSelectedTab(tab.Text); err != nil {
 			log.Printf("failed to save selected tab: %s", err)
 		}
+		// stop the emote animations of chats that the tab switch hides, and
+		// load the emotes of the chat that became visible
+		for channel, messageList := range messageListMap {
+			if channel == tab.Text {
+				messageList.UpdateVisibleEmotes()
+			} else {
+				messageList.UnloadAllEmotes()
+			}
+		}
 		chatTabs.Refresh()
 	}
 

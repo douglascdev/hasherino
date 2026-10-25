@@ -144,3 +144,35 @@ func TestMessageListSetStyle(t *testing.T) {
 		t.Errorf("expected the message to be rebuilt with the message time, got %T", message.content.Objects[0])
 	}
 }
+
+func TestMessageListUnloadAllEmotesUnloadsVisibleMessages(t *testing.T) {
+	app := test.NewApp()
+	defer app.Quit()
+
+	list := NewMessageList()
+	canvas := test.NewCanvas()
+	canvas.SetContent(list)
+	canvas.Resize(fyne.NewSize(300, 200))
+
+	first := NewMessage("first", "", "hello", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+	second := NewMessage("second", "", "hello", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+	list.AddMessage(first)
+	list.AddMessage(second)
+	first.emoteWidgets = []EmoteWidget{newBlockingEmoteWidget()}
+	second.emoteWidgets = []EmoteWidget{newBlockingEmoteWidget()}
+	first.emotesLoaded = true
+	second.emotesLoaded = true
+
+	// unloading everything stops the emotes of every message, for example
+	// when the list is hidden by a tab switch
+	list.UnloadAllEmotes()
+
+	if first.IsEmotesLoaded() || second.IsEmotesLoaded() {
+		t.Error("expected the emotes of every message to be unloaded")
+	}
+	firstWidget := first.emoteWidgets[0].(*blockingEmoteWidget)
+	secondWidget := second.emoteWidgets[0].(*blockingEmoteWidget)
+	if firstWidget.unloads.Load() == 0 || secondWidget.unloads.Load() == 0 {
+		t.Error("expected the emote widgets of every message to be unloaded")
+	}
+}
