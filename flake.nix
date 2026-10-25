@@ -17,6 +17,7 @@
             go_1_27
             gcc
             pkg-config
+            sqlite
           ];
 
           buildInputs = with pkgs; [

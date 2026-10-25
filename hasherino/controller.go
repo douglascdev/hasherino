@@ -119,11 +119,12 @@ func openMemDB() (*gorm.DB, error) {
 
 func (hc *HasherinoController) AddAccount(id string, login string, token string) error {
 	return hc.permDB.Transaction(func(tx *gorm.DB) error {
-		// Get one account, no specific order
-		result := tx.Take(&Account{})
-		// No account exists, so the first one should be active
-		active := result.Error != nil
-		result = tx.Create(&Account{Id: id, Login: login, Token: token, Active: active})
+		var activeCount int64
+		if err := tx.Model(&Account{}).Where("Active = ?", true).Count(&activeCount).Error; err != nil {
+			return err
+		}
+		active := activeCount == 0
+		result := tx.Create(&Account{Id: id, Login: login, Token: token, Active: active})
 		if result.Error != nil {
 			return errors.New("could not create account")
 		}
@@ -157,7 +158,7 @@ func (hc *HasherinoController) GetAccounts() ([]*Account, error) {
 }
 
 func (hc *HasherinoController) SetActiveAccount(id string) error {
-	return hc.permDB.Transaction(func(tx *gorm.DB) error {
+	err := hc.permDB.Transaction(func(tx *gorm.DB) error {
 		// Disable every active account(should be just one, but just in case)
 		activeAccounts := []*Account{}
 		result := tx.Find(&activeAccounts, "Active = ?", true)
@@ -180,26 +181,29 @@ func (hc *HasherinoController) SetActiveAccount(id string) error {
 			return result.Error
 		}
 		account.Active = true
-		result = tx.Save(&account)
-
-		if result.Error != nil {
-			return result.Error
-		}
-
-		if hc.writeWS != nil {
-			hc.writeWS.Close()
-		}
-		go hc.Listen()
-
-		// Commit transation
-		return nil
+		return tx.Save(&account).Error
 	})
+	if err != nil {
+		return err
+	}
+
+	hc.writeWS.Close()
+	go func() {
+		if err := hc.Listen(); err != nil {
+			log.Printf("failed to connect after activating account: %s", err)
+		}
+	}()
+
+	return nil
 }
 
 func (hc *HasherinoController) GetActiveAccount() (*Account, error) {
 	account := &Account{}
 	result := hc.permDB.Take(&account, "Active = ?", true)
 
+	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		return nil, errors.New("no active account")
+	}
 	if result.Error != nil {
 		return nil, result.Error
 	}
@@ -551,6 +555,9 @@ func (hc *HasherinoController) SetSelectedTab(login string) error {
 func (hc *HasherinoController) GetSelectedTab() (*Tab, error) {
 	tab := &Tab{}
 	result := hc.permDB.Take(&tab, "Selected = ?", true)
+	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		return nil, errors.New("no tab selected")
+	}
 	return tab, result.Error
 }
 

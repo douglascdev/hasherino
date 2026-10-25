@@ -77,6 +77,23 @@ func (stubEmotePreviewRenderer) Refresh()                     {}
 func (stubEmotePreviewRenderer) Objects() []fyne.CanvasObject { return nil }
 func (stubEmotePreviewRenderer) Destroy()                     {}
 
+func TestNewChatTabsSelectsFirstAppendedTab(t *testing.T) {
+	app := test.NewApp()
+	defer app.Quit()
+
+	chatTabs := newChatTabs()
+	selected := ""
+	chatTabs.OnSelected = func(tab *container.TabItem) {
+		selected = tab.Text
+	}
+
+	chatTabs.Append(container.NewTabItem("first", widget.NewLabel("")))
+
+	if selected != "first" {
+		t.Fatalf("expected first tab selection callback, got %q", selected)
+	}
+}
+
 func TestAutocompleteEntryInterceptsKeysWhileFocused(t *testing.T) {
 	app := test.NewApp()
 	defer app.Quit()

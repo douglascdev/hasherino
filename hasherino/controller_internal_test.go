@@ -68,6 +68,28 @@ func newSearchEmoteController(t *testing.T) *HasherinoController {
 	}
 }
 
+func TestAddAccountActivatesWhenNoActiveAccount(t *testing.T) {
+	hc := newSearchEmoteController(t)
+	if err := hc.permDB.Create(&Account{Id: "old", Login: "old", Active: false}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := hc.AddAccount("new", "new", "token"); err != nil {
+		t.Fatalf("AddAccount failed: %v", err)
+	}
+	active, err := hc.GetActiveAccount()
+	if err != nil {
+		t.Fatalf("GetActiveAccount failed: %v", err)
+	}
+	if active.Id != "new" {
+		t.Fatalf("unexpected active account: %q", active.Id)
+	}
+}
+
+func TestTwitchChatWebsocketCloseZeroValue(t *testing.T) {
+	(&TwitchChatWebsocket{}).Close()
+}
+
 func TestTabLookupsAcceptMixedCaseLogin(t *testing.T) {
 	hc := newSearchEmoteController(t)
 	if err := hc.permDB.Create(&Account{Id: "account", Active: true}).Error; err != nil {

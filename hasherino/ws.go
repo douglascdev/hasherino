@@ -71,9 +71,16 @@ func (w *TwitchChatWebsocket) Connect() error {
 }
 
 func (w *TwitchChatWebsocket) Close() {
+	if w == nil || (w.cancel == nil && w.connection == nil) {
+		return
+	}
 	log.Println("closing websocket")
-	w.cancel()
-	w.connection.Close(websocket.StatusNormalClosure, "")
+	if w.cancel != nil {
+		w.cancel()
+	}
+	if w.connection != nil {
+		_ = w.connection.Close(websocket.StatusNormalClosure, "")
+	}
 	w.State = Disconnected
 }
 

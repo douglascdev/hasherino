@@ -101,7 +101,10 @@ func NewSettingsTabs(hc *hasherino.HasherinoController, w fyne.Window, onStyleCh
 					dialog.ShowError(errors.New("No account selected"), w)
 					return
 				}
-				hc.SetActiveAccount(selectedAccount.Id)
+				if err := hc.SetActiveAccount(selectedAccount.Id); err != nil {
+					dialog.ShowError(err, w)
+					return
+				}
 				accounts, err = hc.GetAccounts()
 				if err != nil {
 					log.Println(err)
@@ -582,6 +585,12 @@ func NewChatTab(
 	return container.NewTabItem(channel, content)
 }
 
+func newChatTabs() *container.AppTabs {
+	chatTabs := container.NewAppTabs()
+	chatTabs.SetItems(nil)
+	return chatTabs
+}
+
 func main() {
 	a := app.New()
 	w := a.NewWindow("hasherino2")
@@ -594,9 +603,11 @@ func main() {
 		panic(err)
 	}
 
-	chatTabs := container.NewAppTabs()
+	chatTabs := newChatTabs()
 	chatTabs.OnSelected = func(tab *container.TabItem) {
-		hc.SetSelectedTab(tab.Text)
+		if err := hc.SetSelectedTab(tab.Text); err != nil {
+			log.Printf("failed to save selected tab: %s", err)
+		}
 		chatTabs.Refresh()
 	}
 

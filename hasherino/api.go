@@ -133,6 +133,9 @@ func (t *TwitchOAuth) ListenForOAuthRedirect(hc *HasherinoController) {
 			log.Printf("Failed to add account: %s", err)
 			return
 		}
+		if err := hc.Listen(); err != nil {
+			log.Printf("Failed to connect after adding account: %s", err)
+		}
 
 		w.WriteHeader(200)
 		w.Write([]byte("Account added, refresh your accounts list."))
