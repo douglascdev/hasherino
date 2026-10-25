@@ -1,6 +1,7 @@
 package components
 
 import (
+	"image/color"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -89,7 +90,7 @@ func TestMessageRendersTextAndEmotes(t *testing.T) {
 
 	emote := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "FeelsDankMan"}
 	emotes := map[string]*hasherino.Emote{emote.Name: emote}
-	message := NewMessage("author", "hello FeelsDankMan world", testMessageTime, emotes, testEmoteSize, testFontSize, false, nil)
+	message := NewMessage("author", "", "hello FeelsDankMan world", testMessageTime, emotes, testEmoteSize, testFontSize, false, nil)
 
 	emoteWidgets := 0
 	words := 0
@@ -121,7 +122,7 @@ func TestMessageSetEmotesOnlyRebuildsOnChange(t *testing.T) {
 	defer app.Quit()
 
 	emote := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "FeelsDankMan"}
-	message := NewMessage("author", "hello FeelsDankMan", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+	message := NewMessage("author", "", "hello FeelsDankMan", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
 
 	if len(message.emoteWidgets) != 0 {
 		t.Errorf("expected no emotes to be rendered, got %d", len(message.emoteWidgets))
@@ -143,7 +144,7 @@ func TestMessageSetStyleOnlyRebuildsOnChange(t *testing.T) {
 
 	emote := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "FeelsDankMan"}
 	emotes := map[string]*hasherino.Emote{emote.Name: emote}
-	message := NewMessage("author", "hello FeelsDankMan", testMessageTime, emotes, testEmoteSize, testFontSize, false, nil)
+	message := NewMessage("author", "", "hello FeelsDankMan", testMessageTime, emotes, testEmoteSize, testFontSize, false, nil)
 
 	if message.SetStyle(testEmoteSize, testFontSize, false) {
 		t.Error("expected message not to be rebuilt when the style did not change")
@@ -177,12 +178,45 @@ func TestMessageSetStyleOnlyRebuildsOnChange(t *testing.T) {
 	}
 }
 
+func TestMessageColorsAuthorWithIrcColor(t *testing.T) {
+	app := test.NewApp()
+	defer app.Quit()
+
+	message := NewMessage("author", "#FF4500", "hello", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+
+	author, ok := message.content.Objects[0].(*canvas.Text)
+	if !ok {
+		t.Fatalf("expected the first object to be the author, got %T", message.content.Objects[0])
+	}
+	want := color.RGBA{R: 0xff, G: 0x45, B: 0x00, A: 0xff}
+	if author.Color != want {
+		t.Errorf("expected the author color %v, got %v", want, author.Color)
+	}
+}
+
+func TestMessageFallsBackToDefaultAuthorColor(t *testing.T) {
+	app := test.NewApp()
+	defer app.Quit()
+
+	for _, authorColor := range []string{"", "#GGGGGG", "#FF45"} {
+		message := NewMessage("author", authorColor, "hello", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+
+		author, ok := message.content.Objects[0].(*canvas.Text)
+		if !ok {
+			t.Fatalf("expected the first object to be the author, got %T", message.content.Objects[0])
+		}
+		if author.Color != theme.ForegroundColor() {
+			t.Errorf("expected the default author color for %q, got %v", authorColor, author.Color)
+		}
+	}
+}
+
 func TestMessageRendersTimeBeforeAuthorWhenEnabled(t *testing.T) {
 	app := test.NewApp()
 	defer app.Quit()
 
 	timestamp := time.Unix(3600*15+120, 0).UTC()
-	message := NewMessage("author", "hello", timestamp, nil, testEmoteSize, testFontSize, true, nil)
+	message := NewMessage("author", "", "hello", timestamp, nil, testEmoteSize, testFontSize, true, nil)
 
 	if len(message.content.Objects) != 3 {
 		t.Fatalf("expected the message time, author and word, got %d objects", len(message.content.Objects))
@@ -210,7 +244,7 @@ func TestMessageWrapsWhenNarrow(t *testing.T) {
 	app := test.NewApp()
 	defer app.Quit()
 
-	message := NewMessage("author", "a fairly long message that has to wrap over multiple lines", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+	message := NewMessage("author", "", "a fairly long message that has to wrap over multiple lines", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
 
 	message.Resize(fyne.NewSize(500, 10))
 	wide := message.MinSize().Height
@@ -275,7 +309,7 @@ func TestMessageLoadEmotesLoadsEmotesConcurrently(t *testing.T) {
 	defer app.Quit()
 
 	first, second := newBlockingEmoteWidget(), newBlockingEmoteWidget()
-	message := NewMessage("author", "hello", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+	message := NewMessage("author", "", "hello", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
 	message.emoteWidgets = []EmoteWidget{first, second}
 
 	message.LoadEmotes()
@@ -312,7 +346,7 @@ func TestMessageLoadEmotesUnloadsEmotesThatFinishAfterUnload(t *testing.T) {
 	defer app.Quit()
 
 	emote := newBlockingEmoteWidget()
-	message := NewMessage("author", "hello", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+	message := NewMessage("author", "", "hello", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
 	message.emoteWidgets = []EmoteWidget{emote}
 
 	message.LoadEmotes()

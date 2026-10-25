@@ -404,7 +404,7 @@ func NewChatTab(
 			emoteSize := fyne.NewSize(float32(settings.EmoteSize), float32(settings.EmoteSize))
 			fontSize := float32(settings.FontSize)
 			messageList.SetLimit(settings.ChatMessageLimit)
-			messageList.AddMessage(components.NewMessage(message.Author, message.Text, message.Time, emoteCache.ByName(), emoteSize, fontSize, settings.ShowMessageTime, insertEmote))
+			messageList.AddMessage(components.NewMessage(message.Author, message.AuthorColor, message.Text, message.Time, emoteCache.ByName(), emoteSize, fontSize, settings.ShowMessageTime, insertEmote))
 			messageList.ScrollToBottom()
 		})
 	}

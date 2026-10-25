@@ -9,11 +9,12 @@ import (
 )
 
 type ChatMessage struct {
-	Channel string
-	Command string
-	Author  string
-	Text    string
-	Time    time.Time
+	Channel     string
+	Command     string
+	Author      string
+	AuthorColor string // hex color of the author's name from the irc tags, empty when unset
+	Text        string
+	Time        time.Time
 }
 
 func ParseMessage(message string) (*ChatMessage, error) {
@@ -40,11 +41,12 @@ func ParseMessage(message string) (*ChatMessage, error) {
 		}
 	}
 	return &ChatMessage{
-		Channel: channel,
-		Command: msg.Command,
-		Author:  msg.Name,
-		Text:    paramsText,
-		Time:    sentAt,
+		Channel:     channel,
+		Command:     msg.Command,
+		Author:      msg.Name,
+		AuthorColor: msg.Tags["color"],
+		Text:        paramsText,
+		Time:        sentAt,
 	}, nil
 
 }

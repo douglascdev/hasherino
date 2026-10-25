@@ -1,8 +1,10 @@
 package components
 
 import (
+	"image/color"
 	"log"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +26,7 @@ type Message struct {
 	widget.BaseWidget
 
 	author          string
+	authorColor     string
 	text            string
 	timestamp       time.Time
 	onEmoteTapped   func(string) error
@@ -39,9 +42,13 @@ type Message struct {
 	emotesLoaded bool
 }
 
-func NewMessage(author string, text string, timestamp time.Time, emotes map[string]*hasherino.Emote, emoteSize fyne.Size, fontSize float32, showMessageTime bool, onEmoteTapped func(string) error) *Message {
+// NewMessage creates a message. The authorColor is the hex color of the
+// author's name from the irc tags, an empty or invalid color falls back to
+// the default text color.
+func NewMessage(author string, authorColor string, text string, timestamp time.Time, emotes map[string]*hasherino.Emote, emoteSize fyne.Size, fontSize float32, showMessageTime bool, onEmoteTapped func(string) error) *Message {
 	message := &Message{
 		author:          author,
+		authorColor:     authorColor,
 		text:            text,
 		timestamp:       timestamp,
 		onEmoteTapped:   onEmoteTapped,
@@ -192,7 +199,11 @@ func (m *Message) render(emotes map[string]*hasherino.Emote) {
 	if m.showMessageTime {
 		objects = append(objects, newMessageText(m.timestamp.Format(messageTimeFormat), fyne.TextStyle{}, m.fontSize))
 	}
-	objects = append(objects, newMessageText(m.author+":", fyne.TextStyle{Bold: true}, m.fontSize))
+	author := newMessageText(m.author+":", fyne.TextStyle{Bold: true}, m.fontSize)
+	if ircColor, ok := parseHexColor(m.authorColor); ok {
+		author.Color = ircColor
+	}
+	objects = append(objects, author)
 	emoteWidgets := []EmoteWidget{}
 
 	for _, word := range strings.Fields(m.text) {
@@ -239,4 +250,17 @@ func newMessageText(text string, style fyne.TextStyle, fontSize float32) *canvas
 	object.TextSize = fontSize
 	object.TextStyle = style
 	return object
+}
+
+// parseHexColor parses the #RRGGBB colors that irc messages carry.
+func parseHexColor(hex string) (color.Color, bool) {
+	hex = strings.TrimPrefix(hex, "#")
+	if len(hex) != 6 {
+		return nil, false
+	}
+	value, err := strconv.ParseUint(hex, 16, 32)
+	if err != nil {
+		return nil, false
+	}
+	return color.RGBA{R: uint8(value >> 16), G: uint8(value >> 8), B: uint8(value), A: 0xff}, true
 }
