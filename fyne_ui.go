@@ -353,7 +353,7 @@ func (c *channelEmotes) ByName() map[string]*hasherino.Emote {
 func NewChatTab(
 	channel string,
 	sendMsg func(string) error,
-	getEmotes func(string) ([]*hasherino.Emote, error),
+	searchEmotes func(string, int) ([]*hasherino.Emote, error),
 	getChannelEmotes func(string) ([]*hasherino.Emote, error),
 	window fyne.Window,
 	settingsFunc func() (*hasherino.AppSettings, error),
@@ -362,7 +362,7 @@ func NewChatTab(
 	messageList := components.NewMessageList()
 	messageListMap[channel] = messageList
 
-	msgEntry := widget.NewEntry()
+	msgEntry := newAutocompleteEntry()
 	msgEntry.SetPlaceHolder("Message")
 	msgEntry.Validator = func(s string) error {
 		if len(s) > 500 {
@@ -463,13 +463,19 @@ func NewChatTab(
 		msgEntry.SetText("")
 		messageList.ScrollToBottom()
 	}
-	content := container.NewBorder(nil, container.NewBorder(nil, nil, nil, widget.NewButton("😃", func() {
+	var content *fyne.Container
+	autocomplete := newEmoteAutocomplete(msgEntry, searchEmotes, func() {
+		if content != nil {
+			content.Refresh()
+		}
+	})
+	content = container.NewBorder(nil, container.NewVBox(autocomplete.Menu(), container.NewBorder(nil, nil, nil, widget.NewButton("😃", func() {
 		newWindow := fyne.CurrentApp().NewWindow("Select emote")
 		newWindow.Resize(fyne.NewSize(300, 600))
 		newWindow.SetContent(container.NewCenter(widget.NewLabel("Loading...")))
 
 		loadEmoteSearch := func(search string) (*widget.Accordion, error) {
-			emotes, err := getEmotes(search)
+			emotes, err := searchEmotes(search, 0)
 			if err != nil {
 				dialog.ShowError(err, window)
 				return nil, err
@@ -572,7 +578,7 @@ func NewChatTab(
 		}
 
 		searchEntry.OnChanged("")
-	}), msgEntry), nil, nil, messageList)
+	}), msgEntry)), nil, nil, messageList)
 	return container.NewTabItem(channel, content)
 }
 
@@ -625,7 +631,7 @@ func main() {
 
 		for _, tab := range savedTabs {
 			tabIds = append(tabIds, tab.Id)
-			newTab := NewChatTab(tab.Login, sendMessage, hc.GetEmotes, hc.GetChannelEmotes, w, hc.GetSettings)
+			newTab := NewChatTab(tab.Login, sendMessage, hc.SearchEmotes, hc.GetChannelEmotes, w, hc.GetSettings)
 			chatTabs.Append(newTab)
 			if err == nil && selectedTab.Login == tab.Login {
 				chatTabs.Select(newTab)
@@ -656,7 +662,7 @@ func main() {
 						if err != nil {
 							dialog.ShowError(err, w)
 						} else {
-							chatTabs.Append(NewChatTab(entry.Text, sendMessage, hc.GetEmotes, hc.GetChannelEmotes, w, hc.GetSettings))
+							chatTabs.Append(NewChatTab(entry.Text, sendMessage, hc.SearchEmotes, hc.GetChannelEmotes, w, hc.GetSettings))
 							newTabDialog.Hide()
 						}
 					}

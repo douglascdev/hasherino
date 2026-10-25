@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 
 	"gorm.io/driver/sqlite"
@@ -402,7 +403,15 @@ func (hc *HasherinoController) AddTempTabs(channelIds *[]string) error {
 	return err
 }
 
+// GetEmotes returns every emote matching the search for the selected tab.
 func (hc *HasherinoController) GetEmotes(search string) ([]*Emote, error) {
+	return hc.SearchEmotes(search, 0)
+}
+
+// SearchEmotes returns emotes matching the search for the selected tab. Exact
+// matches come first, followed by prefix matches and then substring matches.
+// A non-positive limit returns every match.
+func (hc *HasherinoController) SearchEmotes(search string, limit int) ([]*Emote, error) {
 	emotes := []*Emote{}
 	err := hc.memDB.Transaction(func(tx *gorm.DB) error {
 		tab := &Tab{}
@@ -415,10 +424,20 @@ func (hc *HasherinoController) GetEmotes(search string) ([]*Emote, error) {
 		if result.Error != nil {
 			return result.Error
 		}
-		query := "(owner_id = ? OR owner_id = '') AND (channel_id = ? OR channel_id IS NULL) AND (name LIKE ?)"
-		search = "%" + search + "%"
-		result = tx.Where(query, activeAccount.Id, tab.Id, search).Find(&emotes)
-		log.Println("Query found " + strconv.Itoa(len(emotes)) + " emotes for tab " + tab.Login)
+
+		escaped := escapeLikePattern(search)
+		query := `(owner_id = ? OR owner_id = '') AND (channel_id = ? OR channel_id IS NULL) AND name LIKE ? ESCAPE '\'`
+		order := clause.OrderBy{Expression: clause.Expr{
+			SQL:  `CASE WHEN name = ? COLLATE NOCASE THEN 0 WHEN name LIKE ? ESCAPE '\' THEN 1 ELSE 2 END, name COLLATE NOCASE`,
+			Vars: []interface{}{search, escaped + "%"},
+		}}
+
+		result = tx.Where(query, activeAccount.Id, tab.Id, "%"+escaped+"%").Order(order)
+		if limit > 0 {
+			result = result.Limit(limit)
+		}
+		result = result.Find(&emotes)
+		log.Printf("Found %d emotes for tab %s (query %q, limit %d)", len(emotes), tab.Login, search, limit)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -428,6 +447,10 @@ func (hc *HasherinoController) GetEmotes(search string) ([]*Emote, error) {
 		return nil, err
 	}
 	return emotes, nil
+}
+
+func escapeLikePattern(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(value)
 }
 
 // GetChannelEmotes returns every emote that can be rendered in the given channel,
