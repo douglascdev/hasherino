@@ -122,7 +122,8 @@ func (m *Message) SetStyle(emoteSize fyne.Size, fontSize float32, showMessageTim
 }
 
 // LoadEmotes starts loading the emotes of this message. It is meant to be
-// called when the message scrolls into view.
+// called when the message scrolls into view. The emotes load concurrently, so
+// a slow emote does not delay the others.
 func (m *Message) LoadEmotes() {
 	m.lock.Lock()
 	if m.emotesLoaded {
@@ -137,17 +138,21 @@ func (m *Message) LoadEmotes() {
 		return
 	}
 
-	go func() {
-		for _, emote := range emoteWidgets {
+	var wg sync.WaitGroup
+	for _, emote := range emoteWidgets {
+		wg.Add(1)
+		go func(emote EmoteWidget) {
+			defer wg.Done()
 			if err := emote.LazyLoad(); err != nil {
 				log.Printf("Failed to load emote: %s", err)
 			}
-			if !m.IsEmotesLoaded() {
-				if err := emote.LazyUnload(); err != nil {
-					log.Printf("Failed to unload emote: %s", err)
-				}
-				return
-			}
+		}(emote)
+	}
+	go func() {
+		wg.Wait()
+		// the message scrolled out of view while loading, so undo the load
+		if !m.IsEmotesLoaded() {
+			unloadEmotes(emoteWidgets)
 		}
 	}()
 }

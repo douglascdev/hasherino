@@ -87,7 +87,6 @@ type Emote struct {
 	ChannelID *string   `gorm:"primaryKey"`                       // if a channel is set, only renders in that channel
 	OwnerID   string    `gorm:"primaryKey;index"`                 // Foreign key field
 	Owner     *ChatUser `gorm:"foreignKey:OwnerID;references:Id"` // if an owner is set, only renders when the message sender is the owner
-	TempFile  string
 }
 
 func (e *Emote) GetUrl() (string, error) {

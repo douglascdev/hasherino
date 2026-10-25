@@ -1,19 +1,16 @@
 package components
 
 import (
-	"bytes"
 	"image"
 	"image/color/palette"
 	"image/draw"
 	"image/gif"
-	"io"
 	"log"
 	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
-	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
 	"github.com/Hashy-Software/hasherino-go/hasherino"
 )
@@ -34,6 +31,9 @@ type EmoteGif struct {
 	emote         *hasherino.Emote
 	clickCallback func(string) error
 	lazyLoad      bool
+	// loaded tracks whether src holds the real gif, so that a failed load
+	// is retried on the next start
+	loaded bool
 }
 
 // NewEmoteGif creates a new widget loaded to show the specified image resource.
@@ -49,11 +49,17 @@ func NewEmoteGif(emote *hasherino.Emote, clickCallback func(string) error, lazyL
 		return ret, nil
 	}
 
-	res, err := tempFileResource(emote)
+	src, err := getEmoteCache().Gif(emote)
 	if err != nil {
 		return ret, err
 	}
-	return ret, ret.LoadResource(res)
+	ret.src = src
+	ret.loaded = true
+	fyne.Do(func() {
+		ret.dst.Image = src.Image[0]
+		ret.dst.Refresh()
+	})
+	return ret, nil
 }
 
 // CreateRenderer loads the widget renderer for this widget. This is an internal requirement for Fyne.
@@ -61,52 +67,13 @@ func (g *EmoteGif) CreateRenderer() fyne.WidgetRenderer {
 	return &gifRenderer{gif: g}
 }
 
-// Load is used to change the gif file shown.
-// It will change the loaded content and prepare the new frames for animation.
-func (g *EmoteGif) Load(u fyne.URI) error {
-	fyne.Do(func() {
-		g.dst.Image = nil
-		g.dst.Refresh()
-	})
-
-	if u == nil {
-		return nil
-	}
-
-	read, err := storage.Reader(u)
-	if err != nil {
-		return err
-	}
-
-	return g.load(read)
-}
-
-// LoadResource is used to change the gif resource shown.
-// It will change the loaded content and prepare the new frames for animation.
-func (g *EmoteGif) LoadResource(r fyne.Resource) error {
-	fyne.Do(func() {
-		g.dst.Image = nil
-		g.dst.Refresh()
-	})
-
-	if r == nil || len(r.Content()) == 0 {
-		return nil
-	}
-	return g.load(bytes.NewReader(r.Content()))
-}
-
-func (g *EmoteGif) load(read io.Reader) error {
-	pix, err := gif.DecodeAll(read)
-	if err != nil {
-		return err
-	}
-	g.src = pix
-	fyne.Do(func() {
-		g.dst.Image = pix.Image[0]
-		g.dst.Refresh()
-	})
-
-	return nil
+// emptyGif is a gif that renders as nothing. It is used when the real gif
+// failed to load and when an animation stopped, so that pending draws never
+// see a nil gif. It is shared because it is never modified.
+var emptyGif = &gif.GIF{
+	Image:     []*image.Paletted{image.NewPaletted(image.Rect(0, 0, 1, 1), palette.Plan9)},
+	Disposal:  []byte{gif.DisposalNone},
+	LoopCount: -1,
 }
 
 // MinSize returns the minimum size that this GIF can occupy.
@@ -136,8 +103,11 @@ func (g *EmoteGif) draw(dst draw.Image, frame image.Image, dispose byte, index i
 		draw.Draw(dst, bounds, frame, image.Point{}, draw.Src)
 	case gif.DisposalPrevious:
 		// restore frame with previous image then render new frame over it
-		if g.noDisposeIndex >= 0 && g.src != nil && g.noDisposeIndex < len(g.src.Image) {
-			draw.Draw(dst, bounds, g.src.Image[g.noDisposeIndex], image.Point{}, draw.Src)
+		g.runLock.RLock()
+		src := g.src
+		g.runLock.RUnlock()
+		if g.noDisposeIndex >= 0 && src != nil && g.noDisposeIndex < len(src.Image) {
+			draw.Draw(dst, bounds, src.Image[g.noDisposeIndex], image.Point{}, draw.Src)
 			draw.Draw(dst, bounds, frame, image.Point{}, draw.Over)
 		} else {
 			// there was no previous graphic, render background instead?
@@ -151,32 +121,40 @@ func (g *EmoteGif) draw(dst draw.Image, frame image.Image, dispose byte, index i
 	g.dst.Refresh()
 }
 
-func (g *EmoteGif) loadEmpty() {
-	g.src = &gif.GIF{}
-	g.src.Image = []*image.Paletted{image.NewPaletted(image.Rect(0, 0, 1, 1), palette.Plan9)}
-	g.src.Disposal = []byte{gif.DisposalNone}
-	g.src.LoopCount = -1
-}
-
 // Start begins the animation. The speed of the transition is controlled by the loaded gif file.
 func (g *EmoteGif) Start() {
-	if g.isRunning() {
+	g.runLock.Lock()
+	running := g.running
+	needsLoad := g.lazyLoad && !g.loaded
+	g.runLock.Unlock()
+	if running {
 		return
 	}
-	if g.lazyLoad {
-		res, err := tempFileResource(g.emote)
+
+	// load outside of the lock, a download must not block Stop
+	var src *gif.GIF
+	var loaded bool
+	if needsLoad {
+		var err error
+		src, err = getEmoteCache().Gif(g.emote)
 		if err != nil {
 			log.Println("Error loading lazy gif", err)
-			g.loadEmpty()
+			src = emptyGif
 		} else {
-			err = g.LoadResource(res)
-			if err != nil {
-				log.Println("Error loading lazy gif", err)
-				g.loadEmpty()
-			}
+			loaded = true
 		}
 	}
+
 	g.runLock.Lock()
+	if g.running {
+		// another Start loaded the gif while this one was downloading
+		g.runLock.Unlock()
+		return
+	}
+	if src != nil {
+		g.src = src
+		g.loaded = loaded
+	}
 	g.running = true
 	g.runLock.Unlock()
 
@@ -184,10 +162,11 @@ func (g *EmoteGif) Start() {
 		return
 	}
 	buffer := image.NewNRGBA(g.src.Image[0].Bounds())
+	firstFrame := g.src.Image[0]
 	fyne.Do(func() {
 		g.dst.Image = buffer
 		g.noDisposeIndex = -1
-		g.draw(buffer, g.src.Image[0], gif.DisposalNone, 0)
+		g.draw(buffer, firstFrame, gif.DisposalNone, 0)
 	})
 
 	go func() {
@@ -208,9 +187,15 @@ func (g *EmoteGif) Start() {
 					dispose = g.src.Disposal[c-1]
 				}
 				if g.isStopping() {
+					g.runLock.Lock()
 					if g.lazyLoad {
-						g.loadEmpty()
+						// release the decoded frames, the shared emote cache
+						// keeps them for the next start. The placeholder keeps
+						// pending draws from seeing a nil gif.
+						g.src = emptyGif
+						g.loaded = false
 					}
+					g.runLock.Unlock()
 					break loop
 				}
 				fyne.Do(func() {

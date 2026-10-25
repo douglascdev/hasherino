@@ -1,6 +1,7 @@
 package components
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
 
 	"github.com/Hashy-Software/hasherino-go/hasherino"
 )
@@ -217,5 +219,124 @@ func TestMessageWrapsWhenNarrow(t *testing.T) {
 
 	if narrow <= wide {
 		t.Errorf("expected the message to grow when narrowed, got %f and %f", wide, narrow)
+	}
+}
+
+// blockingEmoteWidget blocks in LazyLoad until it is allowed to finish.
+type blockingEmoteWidget struct {
+	widget.BaseWidget
+	min     fyne.Size
+	starts  atomic.Int32
+	loads   atomic.Int32
+	unloads atomic.Int32
+	allow   chan struct{}
+}
+
+func newBlockingEmoteWidget() *blockingEmoteWidget {
+	w := &blockingEmoteWidget{allow: make(chan struct{})}
+	w.ExtendBaseWidget(w)
+	return w
+}
+
+func (w *blockingEmoteWidget) SetMinSize(size fyne.Size) {
+	w.min = size
+}
+
+func (w *blockingEmoteWidget) MinSize() fyne.Size {
+	return w.min
+}
+
+func (w *blockingEmoteWidget) LazyLoad() error {
+	w.starts.Add(1)
+	<-w.allow
+	w.loads.Add(1)
+	return nil
+}
+
+func (w *blockingEmoteWidget) LazyUnload() error {
+	w.unloads.Add(1)
+	return nil
+}
+
+func (w *blockingEmoteWidget) CreateRenderer() fyne.WidgetRenderer {
+	return blockingEmoteWidgetRenderer{}
+}
+
+type blockingEmoteWidgetRenderer struct{}
+
+func (blockingEmoteWidgetRenderer) Layout(fyne.Size)             {}
+func (blockingEmoteWidgetRenderer) MinSize() fyne.Size           { return fyne.NewSize(1, 1) }
+func (blockingEmoteWidgetRenderer) Refresh()                     {}
+func (blockingEmoteWidgetRenderer) Objects() []fyne.CanvasObject { return nil }
+func (blockingEmoteWidgetRenderer) Destroy()                     {}
+
+func TestMessageLoadEmotesLoadsEmotesConcurrently(t *testing.T) {
+	app := test.NewApp()
+	defer app.Quit()
+
+	first, second := newBlockingEmoteWidget(), newBlockingEmoteWidget()
+	message := NewMessage("author", "hello", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+	message.emoteWidgets = []EmoteWidget{first, second}
+
+	message.LoadEmotes()
+
+	// both emotes start loading even though neither finished, so the loads
+	// run concurrently instead of one after another
+	deadline := time.Now().Add(time.Second)
+	for (first.starts.Load() == 0 || second.starts.Load() == 0) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if first.starts.Load() == 0 || second.starts.Load() == 0 {
+		t.Fatal("expected both emotes to start loading concurrently")
+	}
+
+	close(first.allow)
+	close(second.allow)
+
+	deadline = time.Now().Add(time.Second)
+	for (first.loads.Load() == 0 || second.loads.Load() == 0) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if first.loads.Load() == 0 || second.loads.Load() == 0 {
+		t.Fatal("expected both emotes to finish loading")
+	}
+
+	// the message stays loaded, so nothing is unloaded
+	if first.unloads.Load() != 0 || second.unloads.Load() != 0 {
+		t.Errorf("expected no emotes to be unloaded, got %d and %d", first.unloads.Load(), second.unloads.Load())
+	}
+}
+
+func TestMessageLoadEmotesUnloadsEmotesThatFinishAfterUnload(t *testing.T) {
+	app := test.NewApp()
+	defer app.Quit()
+
+	emote := newBlockingEmoteWidget()
+	message := NewMessage("author", "hello", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+	message.emoteWidgets = []EmoteWidget{emote}
+
+	message.LoadEmotes()
+
+	deadline := time.Now().Add(time.Second)
+	for emote.starts.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if emote.starts.Load() == 0 {
+		t.Fatal("expected the emote to start loading")
+	}
+
+	// the message scrolls out of view while the emote is still loading
+	message.UnloadEmotes()
+	close(emote.allow)
+
+	deadline = time.Now().Add(time.Second)
+	for emote.loads.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if emote.loads.Load() == 0 {
+		t.Fatal("expected the emote to finish loading")
+	}
+	if emote.unloads.Load() == 0 {
+		t.Error("expected the emote to be unloaded after finishing its load")
 	}
 }

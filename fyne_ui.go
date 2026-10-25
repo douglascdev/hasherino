@@ -295,9 +295,11 @@ type channelEmotes struct {
 }
 
 const (
-	emoteCacheLifetime = 10 * time.Second
-	emotePollInterval  = 2 * time.Second
-	emotePollAttempts  = 30
+	emoteCacheLifetime     = 10 * time.Second
+	emotePollFirstInterval = 100 * time.Millisecond
+	emotePollMaxInterval   = 2 * time.Second
+	emotePollAttempts      = 40
+	emotePickerLimit       = 200
 )
 
 func newChannelEmotes(channel string, getEmotes func(string) ([]*hasherino.Emote, error)) *channelEmotes {
@@ -432,9 +434,13 @@ func NewChatTab(
 	go func() {
 		// The emotes of the channel are loaded in the background and usually
 		// finish after the chat history is rendered, so keep refreshing them
-		// until they are available and give the messages their emotes.
+		// until they are available and give the messages their emotes. The
+		// first checks are fast so freshly loaded emotes are picked up
+		// quickly, later checks back off to not hammer the database.
+		interval := emotePollFirstInterval
 		for range emotePollAttempts {
-			time.Sleep(emotePollInterval)
+			time.Sleep(interval)
+			interval = min(interval*2, emotePollMaxInterval)
 			_, err := emoteCache.ForceRefresh()
 			if err != nil {
 				log.Println(err)
@@ -478,7 +484,7 @@ func NewChatTab(
 		newWindow.SetContent(container.NewCenter(widget.NewLabel("Loading...")))
 
 		loadEmoteSearch := func(search string) (*widget.Accordion, error) {
-			emotes, err := searchEmotes(search, 0)
+			emotes, err := searchEmotes(search, emotePickerLimit)
 			if err != nil {
 				dialog.ShowError(err, window)
 				return nil, err
