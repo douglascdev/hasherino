@@ -84,6 +84,8 @@ type Emote struct {
 	Source    EmoteSourceEnum `gorm:"primaryKey"`
 	Name      string
 	Animated  bool
+	Width     int       // intrinsic width of the emote from its CDN, 0 when unknown
+	Height    int       // intrinsic height of the emote from its CDN, 0 when unknown
 	ChannelID *string   `gorm:"primaryKey"`                       // if a channel is set, only renders in that channel
 	OwnerID   string    `gorm:"primaryKey;index"`                 // Foreign key field
 	Owner     *ChatUser `gorm:"foreignKey:OwnerID;references:Id"` // if an owner is set, only renders when the message sender is the owner

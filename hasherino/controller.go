@@ -309,11 +309,14 @@ func (hc *HasherinoController) AddTempTabs(channelIds *[]string) error {
 				log.Printf("Failed to load global 7tv emotes: %s", err)
 			} else {
 				for _, emote := range globalEmotes.Data.EmoteSet.Emotes {
+					width, height := emote.Data.Dimensions()
 					emoteObjs = append(emoteObjs, Emote{
 						Id:        emote.ID,
 						Source:    SevenTV,
 						Name:      emote.Name,
 						Animated:  emote.Data.Animated,
+						Width:     width,
+						Height:    height,
 						ChannelID: nil,
 						OwnerID:   "",
 						Owner:     nil,
@@ -355,11 +358,14 @@ func (hc *HasherinoController) AddTempTabs(channelIds *[]string) error {
 					continue
 				}
 				for _, emote := range emoteSet.Emotes {
+					width, height := emote.Data.Dimensions()
 					channelEmotes = append(channelEmotes, Emote{
 						Id:        emote.Data.ID,
 						Source:    SevenTV,
 						Name:      emote.Name,
 						Animated:  emote.Data.Animated,
+						Width:     width,
+						Height:    height,
 						ChannelID: &channelId,
 						OwnerID:   "",
 						Owner:     nil,

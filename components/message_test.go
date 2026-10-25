@@ -178,6 +178,25 @@ func TestMessageSetStyleOnlyRebuildsOnChange(t *testing.T) {
 	}
 }
 
+func TestMessageSizesEmotesByHeight(t *testing.T) {
+	app := test.NewApp()
+	defer app.Quit()
+
+	wide := &hasherino.Emote{Id: "wide", Source: hasherino.SevenTV, Name: "wide", Width: 224, Height: 112}
+	tall := &hasherino.Emote{Id: "tall", Source: hasherino.SevenTV, Name: "tall", Width: 112, Height: 224}
+	emotes := map[string]*hasherino.Emote{wide.Name: wide, tall.Name: tall}
+	message := NewMessage("author", "", "wide tall", testMessageTime, emotes, testEmoteSize, testFontSize, false, nil)
+
+	// emotes keep their aspect ratio, capped by the emote height, instead
+	// of being squeezed into a square
+	if got, want := message.emoteWidgets[0].MinSize(), fyne.NewSize(56, 28); got != want {
+		t.Errorf("expected the wide emote at %v, got %v", want, got)
+	}
+	if got, want := message.emoteWidgets[1].MinSize(), fyne.NewSize(14, 28); got != want {
+		t.Errorf("expected the tall emote at %v, got %v", want, got)
+	}
+}
+
 func TestMessageColorsAuthorWithIrcColor(t *testing.T) {
 	app := test.NewApp()
 	defer app.Quit()

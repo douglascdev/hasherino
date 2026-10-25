@@ -271,18 +271,53 @@ func GetChatHistory(channel string, limit int) (*[]ChatMessage, error) {
 	return &messages, nil
 }
 
-type EmoteSet struct {
-	ID     string `json:"id"`
+// STVFile is one file variant of a 7tv emote, e.g. its 2x webp.
+type STVFile struct {
 	Name   string `json:"name"`
-	Emotes []struct {
-		Name string `json:"name"`
-		Data struct {
-			ID       string `json:"id"`
-			Name     string `json:"name"`
-			Animated bool   `json:"animated"`
-			Listed   bool   `json:"listed"`
-		} `json:"data"`
-	} `json:"emotes"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+}
+
+// STVHost holds the CDN files of a 7tv emote.
+type STVHost struct {
+	URL   string    `json:"url"`
+	Files []STVFile `json:"files"`
+}
+
+// STVEmoteData is the emote data of a 7tv emote set entry.
+type STVEmoteData struct {
+	ID       string  `json:"id"`
+	Name     string  `json:"name"`
+	Animated bool    `json:"animated"`
+	Listed   bool    `json:"listed"`
+	Host     STVHost `json:"host"`
+}
+
+// Dimensions returns the size of the smallest file of the emote, its
+// intrinsic size that defines the aspect ratio it renders at.
+func (d *STVEmoteData) Dimensions() (width int, height int) {
+	for _, file := range d.Host.Files {
+		if file.Width <= 0 || file.Height <= 0 {
+			continue
+		}
+		if width == 0 || file.Width*file.Height < width*height {
+			width, height = file.Width, file.Height
+		}
+	}
+	return width, height
+}
+
+// EmoteSetEmote is one entry of a 7tv emote set.
+type EmoteSetEmote struct {
+	ID   string       `json:"id"`
+	Name string       `json:"name"`
+	Data STVEmoteData `json:"data"`
+}
+
+type EmoteSet struct {
+	ID     string          `json:"id"`
+	Name   string          `json:"name"`
+	Emotes []EmoteSetEmote `json:"emotes"`
 }
 
 type STVUserJson struct {
@@ -339,21 +374,29 @@ func STVGetUser(userId string) (*STVUserJson, error) {
             				id
             				name
             				emotes {
-    										name
-                				data {
-                    				id
-                    				name
-                    				animated
-                    				listed
-                				}
+            						id
+            						name
+            						data {
+                						id
+                    					name
+                    					animated
+                    					listed
+                    					host {
+                    							files {
+                    									name
+                    									width
+                    									height
+                    							}
+                    					}
+                					}
             				}
         				}
-    						connections {
+        					connections {
             				platform
             				emote_set_id
         				}
-      }
-  }`,
+      		}
+  		}`,
 		"variables": map[string]interface{}{
 			"platform": "TWITCH",
 			"id":       userId,
@@ -397,18 +440,9 @@ func STVGetUser(userId string) (*STVUserJson, error) {
 type STVGlobalEmotesJson struct {
 	Data struct {
 		EmoteSet struct {
-			ID     string `json:"id"`
-			Name   string `json:"name"`
-			Emotes []struct {
-				ID   string `json:"id"`
-				Name string `json:"name"`
-				Data struct {
-					ID       string `json:"id"`
-					Name     string `json:"name"`
-					Animated bool   `json:"animated"`
-					Listed   bool   `json:"listed"`
-				} `json:"data"`
-			} `json:"emotes"`
+			ID     string          `json:"id"`
+			Name   string          `json:"name"`
+			Emotes []EmoteSetEmote `json:"emotes"`
 		} `json:"emoteSet"`
 	} `json:"data"`
 }
@@ -435,6 +469,13 @@ func STVGetGlobalEmotes() (*STVGlobalEmotesJson, error, bool) {
                 			name
                 			animated
                 			listed
+                			host {
+                					files {
+                							name
+                							width
+                							height
+                					}
+                			}
             			}
         			}
     			}

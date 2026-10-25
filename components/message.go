@@ -220,7 +220,7 @@ func (m *Message) render(emotes map[string]*hasherino.Emote) {
 			continue
 		}
 
-		emoteWidget.SetMinSize(m.emoteSize)
+		emoteWidget.SetMinSize(EmoteSizeFor(emote, m.emoteSize))
 		emoteWidgets = append(emoteWidgets, emoteWidget)
 		objects = append(objects, emoteWidget)
 	}

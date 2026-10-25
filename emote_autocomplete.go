@@ -336,7 +336,7 @@ func newEmoteOptionRow(emote *hasherino.Emote, previewFactory emotePreviewFactor
 		if err != nil {
 			log.Printf("Failed to create preview for emote %s: %v", emote.Name, err)
 		} else if preview != nil {
-			preview.SetMinSize(fyne.NewSize(emoteSuggestionPreviewSize, emoteSuggestionPreviewSize))
+			preview.SetMinSize(components.EmoteSizeFor(emote, fyne.NewSize(emoteSuggestionPreviewSize, emoteSuggestionPreviewSize)))
 			row.preview = preview
 		}
 	}
