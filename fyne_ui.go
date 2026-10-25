@@ -658,11 +658,12 @@ func main() {
 				var newTabDialog *dialog.FormDialog
 				addTabFunc := func(b bool) {
 					if b {
-						err := hc.AddTab(entry.Text)
+						channel := strings.ToLower(strings.TrimSpace(entry.Text))
+						err := hc.AddTab(channel)
 						if err != nil {
 							dialog.ShowError(err, w)
 						} else {
-							chatTabs.Append(NewChatTab(entry.Text, sendMessage, hc.SearchEmotes, hc.GetChannelEmotes, w, hc.GetSettings))
+							chatTabs.Append(NewChatTab(channel, sendMessage, hc.SearchEmotes, hc.GetChannelEmotes, w, hc.GetSettings))
 							newTabDialog.Hide()
 						}
 					}

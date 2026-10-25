@@ -68,6 +68,31 @@ func newSearchEmoteController(t *testing.T) *HasherinoController {
 	}
 }
 
+func TestTabLookupsAcceptMixedCaseLogin(t *testing.T) {
+	hc := newSearchEmoteController(t)
+	if err := hc.permDB.Create(&Account{Id: "account", Active: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := hc.permDB.Create(&Tab{Id: "tab", Login: "mychannel", Selected: false}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := hc.SetSelectedTab("MyChannel"); err != nil {
+		t.Fatalf("SetSelectedTab failed: %v", err)
+	}
+	selected, err := hc.GetSelectedTab()
+	if err != nil {
+		t.Fatalf("GetSelectedTab failed: %v", err)
+	}
+	if selected.Login != "mychannel" {
+		t.Fatalf("unexpected selected tab: %q", selected.Login)
+	}
+
+	if _, err := hc.GetChannelEmotes("MyChannel"); err != nil {
+		t.Fatalf("GetChannelEmotes failed: %v", err)
+	}
+}
+
 func TestSearchEmotesRanksFiltersAndLimits(t *testing.T) {
 	hc := newSearchEmoteController(t)
 	if err := hc.permDB.Create(&Account{Id: "account", Active: true}).Error; err != nil {

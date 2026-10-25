@@ -212,6 +212,8 @@ func (hc *HasherinoController) OpenOAuthPage() {
 }
 
 func (hc *HasherinoController) AddTab(channel string) error {
+	channel = strings.ToLower(strings.TrimSpace(channel))
+
 	err := hc.permDB.Transaction(func(tx *gorm.DB) error {
 		_, exists := hc.readWS.channels[channel]
 		if exists {
@@ -219,7 +221,7 @@ func (hc *HasherinoController) AddTab(channel string) error {
 		}
 
 		activeAccount := &Account{}
-		result := hc.permDB.Take(&activeAccount, "Active = ?", true)
+		result := tx.Take(&activeAccount, "Active = ?", true)
 		if result.Error != nil {
 			return errors.New("no active account")
 		}
@@ -230,19 +232,23 @@ func (hc *HasherinoController) AddTab(channel string) error {
 			return errors.New("failed to obtain channel's id and login")
 		}
 
+		login := strings.ToLower(users.Data[0].Login)
 		tab := &Tab{
 			Id:          users.Data[0].ID,
-			Login:       users.Data[0].Login,
+			Login:       login,
 			DisplayName: users.Data[0].DisplayName,
 			Selected:    false,
 		}
 
 		result = tx.Create(&tab)
+		if result.Error != nil {
+			return result.Error
+		}
 
-		err = hc.readWS.Join(channel)
+		err = hc.readWS.Join(login)
 		if err != nil {
-			log.Printf("failed to join channel %s: %s", channel, err)
-			return errors.New("failed to join channel " + channel)
+			log.Printf("failed to join channel %s: %s", login, err)
+			return errors.New("failed to join channel " + login)
 		}
 
 		err = hc.AddTempTabs(&[]string{users.Data[0].ID})
@@ -457,7 +463,7 @@ func escapeLikePattern(value string) string {
 // regardless of the currently selected tab.
 func (hc *HasherinoController) GetChannelEmotes(channel string) ([]*Emote, error) {
 	tab := &Tab{}
-	result := hc.permDB.Take(&tab, "Login = ?", channel)
+	result := hc.permDB.Take(&tab, "Login = ? COLLATE NOCASE", channel)
 	if result.Error != nil {
 		return nil, result.Error
 	}
@@ -511,6 +517,8 @@ func (hc *HasherinoController) GetTabs() ([]*Tab, error) {
 }
 
 func (hc *HasherinoController) SetSelectedTab(login string) error {
+	login = strings.ToLower(strings.TrimSpace(login))
+
 	return hc.permDB.Transaction(func(tx *gorm.DB) error {
 		selectedTabs := []*Tab{}
 		result := tx.Find(&selectedTabs, "Selected = ?", true)
@@ -527,7 +535,7 @@ func (hc *HasherinoController) SetSelectedTab(login string) error {
 			}
 		}
 		tab := &Tab{}
-		result = hc.permDB.Take(&tab, "Login = ?", login)
+		result = tx.Take(&tab, "Login = ? COLLATE NOCASE", login)
 		if result.Error != nil {
 			return result.Error
 		}
