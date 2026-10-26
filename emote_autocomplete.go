@@ -11,6 +11,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
@@ -30,7 +31,8 @@ type emotePreviewFactory func(*hasherino.Emote, func(string) error) (components.
 
 type autocompleteEntry struct {
 	widget.Entry
-	onTypedKey func(*fyne.KeyEvent) bool
+	onTypedKey   func(*fyne.KeyEvent) bool
+	onAcceptsTab func() bool
 }
 
 func newAutocompleteEntry() *autocompleteEntry {
@@ -44,6 +46,22 @@ func (e *autocompleteEntry) TypedKey(key *fyne.KeyEvent) {
 		return
 	}
 	e.Entry.TypedKey(key)
+}
+
+// AcceptsTab reports whether the entry consumes the Tab key or leaves it to
+// the focus navigation. It consumes Tab when it can complete the word at
+// the cursor, so single line entries still navigate with Tab while their
+// cursor does not sit on a word. Shift+Tab always stays navigation.
+func (e *autocompleteEntry) AcceptsTab() bool {
+	if e.onAcceptsTab == nil {
+		return e.Entry.AcceptsTab()
+	}
+	if driver, ok := fyne.CurrentApp().Driver().(desktop.Driver); ok {
+		if driver.CurrentKeyModifiers()&fyne.KeyModifierShift != 0 {
+			return false
+		}
+	}
+	return e.onAcceptsTab()
 }
 
 type emoteAutocomplete struct {
@@ -74,6 +92,7 @@ func newEmoteAutocomplete(entry *autocompleteEntry, search emoteSearchFunc, refr
 	}
 	autocomplete.menu.Hide()
 	entry.onTypedKey = autocomplete.handleKey
+	entry.onAcceptsTab = autocomplete.acceptsTab
 	entry.OnChanged = autocomplete.onChanged
 	return autocomplete
 }
@@ -123,22 +142,73 @@ func (a *emoteAutocomplete) onChanged(text string) {
 	})
 }
 
+// acceptsTab reports whether pressing Tab does something: accepting the
+// selected suggestion of the menu or completing the word at the cursor.
+func (a *emoteAutocomplete) acceptsTab() bool {
+	if a.menu.Visible() && len(a.suggestions) > 0 {
+		return true
+	}
+	_, _, _, ok := tabTokenAt(a.entry.Text, a.entry.CursorColumn)
+	return ok
+}
+
 func (a *emoteAutocomplete) handleKey(key *fyne.KeyEvent) bool {
-	if !a.menu.Visible() || len(a.suggestions) == 0 {
+	if a.menu.Visible() && len(a.suggestions) > 0 {
+		switch key.Name {
+		case fyne.KeyDown:
+			a.setSelection(a.selected + 1)
+		case fyne.KeyUp:
+			a.setSelection(a.selected - 1)
+		case fyne.KeyEnter, fyne.KeyReturn, fyne.KeyTab:
+			a.accept(a.suggestions[a.selected].Name)
+		case fyne.KeyEscape:
+			a.hide()
+		default:
+			return false
+		}
+		return true
+	}
+	if key.Name == fyne.KeyTab {
+		return a.handleTab()
+	}
+	return false
+}
+
+// handleTab completes the word at the cursor with the best matching emote.
+// The emote search ranks exact matches first, followed by prefix matches and
+// then substring matches, so its first result is the best completion. It
+// returns whether Tab was consumed, and consumes it whenever a word sits at
+// the cursor, even without a matching emote, so the entry never inserts a
+// tab character instead.
+func (a *emoteAutocomplete) handleTab() bool {
+	tokenStart, tokenEnd, query, ok := tabTokenAt(a.entry.Text, a.entry.CursorColumn)
+	if !ok {
 		return false
 	}
+	// the completion replaces the text, so a pending search of the menu
+	// would act on outdated text
+	a.cancelSearch()
 
-	switch key.Name {
-	case fyne.KeyDown:
-		a.setSelection(a.selected + 1)
-	case fyne.KeyUp:
-		a.setSelection(a.selected - 1)
-	case fyne.KeyEnter, fyne.KeyReturn:
-		a.accept(a.suggestions[a.selected].Name)
-	case fyne.KeyEscape:
-		a.hide()
-	default:
-		return false
+	emotes, err := a.search(query, 1)
+	if err != nil {
+		log.Printf("Failed to search emotes for %q: %v", query, err)
+		return true
+	}
+	if len(emotes) == 0 || emotes[0] == nil {
+		return true
+	}
+
+	text, cursor := replaceToken(a.entry.Text, tokenStart, tokenEnd, emotes[0].Name)
+
+	a.updating = true
+	a.entry.SetText(text)
+	a.entry.CursorRow = 0
+	a.entry.CursorColumn = cursor
+	a.entry.Refresh()
+	a.updating = false
+
+	if canvas := fyne.CurrentApp().Driver().CanvasForObject(a.entry); canvas != nil {
+		canvas.Focus(a.entry)
 	}
 	return true
 }
@@ -264,7 +334,8 @@ func (a *emoteAutocomplete) refreshContent() {
 	}
 }
 
-func emoteTokenAt(text string, cursor int) (tokenStart, tokenEnd int, query string, ok bool) {
+// wordTokenAt returns the range of the word at the cursor position.
+func wordTokenAt(text string, cursor int) (tokenStart, tokenEnd int, ok bool) {
 	runes := []rune(text)
 	if cursor < 0 {
 		cursor = 0
@@ -281,12 +352,40 @@ func emoteTokenAt(text string, cursor int) (tokenStart, tokenEnd int, query stri
 	for tokenEnd < len(runes) && !unicode.IsSpace(runes[tokenEnd]) {
 		tokenEnd++
 	}
+	return tokenStart, tokenEnd, tokenStart != tokenEnd
+}
 
-	if tokenStart == tokenEnd || runes[tokenStart] != ':' {
+// emoteTokenAt returns the emote search token at the cursor, the word that
+// starts with the emote search colon, and the query after the colon.
+func emoteTokenAt(text string, cursor int) (tokenStart, tokenEnd int, query string, ok bool) {
+	tokenStart, tokenEnd, ok = wordTokenAt(text, cursor)
+	if !ok {
+		return 0, 0, "", false
+	}
+	runes := []rune(text)
+	if runes[tokenStart] != ':' {
 		return 0, 0, "", false
 	}
 	queryRunes := runes[tokenStart+1 : tokenEnd]
 	if len(queryRunes) < minEmoteQueryLength {
+		return 0, 0, "", false
+	}
+	return tokenStart, tokenEnd, string(queryRunes), true
+}
+
+// tabTokenAt returns the word at the cursor and the query to complete it
+// with, which drops a leading emote search colon.
+func tabTokenAt(text string, cursor int) (tokenStart, tokenEnd int, query string, ok bool) {
+	tokenStart, tokenEnd, ok = wordTokenAt(text, cursor)
+	if !ok {
+		return 0, 0, "", false
+	}
+	runes := []rune(text)
+	queryRunes := runes[tokenStart:tokenEnd]
+	if queryRunes[0] == ':' {
+		queryRunes = queryRunes[1:]
+	}
+	if len(queryRunes) == 0 {
 		return 0, 0, "", false
 	}
 	return tokenStart, tokenEnd, string(queryRunes), true
@@ -297,18 +396,25 @@ func replaceEmoteToken(text string, cursor int, name string) (string, int, bool)
 	if !ok {
 		return text, cursor, false
 	}
+	replaced, replacementCursor := replaceToken(text, tokenStart, tokenEnd, name)
+	return replaced, replacementCursor, true
+}
 
+// replaceToken replaces the token range with the replacement and returns
+// the text and the cursor position after the replacement. A replacement at
+// the end of the text gains a trailing space.
+func replaceToken(text string, tokenStart, tokenEnd int, replacement string) (string, int) {
 	runes := []rune(text)
-	replacement := []rune(name)
+	replacementRunes := []rune(replacement)
 	if tokenEnd == len(runes) {
-		replacement = append(replacement, ' ')
+		replacementRunes = append(replacementRunes, ' ')
 	}
 
-	replaced := make([]rune, 0, len(runes)-(tokenEnd-tokenStart)+len(replacement))
+	replaced := make([]rune, 0, len(runes)-(tokenEnd-tokenStart)+len(replacementRunes))
 	replaced = append(replaced, runes[:tokenStart]...)
-	replaced = append(replaced, replacement...)
+	replaced = append(replaced, replacementRunes...)
 	replaced = append(replaced, runes[tokenEnd:]...)
-	return string(replaced), tokenStart + len(replacement), true
+	return string(replaced), tokenStart + len(replacementRunes)
 }
 
 type emoteOptionRow struct {
