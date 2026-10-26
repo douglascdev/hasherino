@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"image"
 	"image/gif"
+	"image/png"
 	"io"
 	"log"
 	"net/http"
@@ -150,7 +151,8 @@ func cleanEmoteCache(dir string) {
 }
 
 // Image returns the decoded still image of the emote, downloading and caching
-// it if necessary.
+// it if necessary. For animated emotes it is the first frame of the
+// animation.
 func (c *emoteCache) Image(emote *hasherino.Emote) (image.Image, error) {
 	img, _, err := c.load(emote)
 	if err != nil {
@@ -214,8 +216,12 @@ func (c *emoteCache) load(emote *hasherino.Emote) (image.Image, *gifAnimation, e
 	return img, animation, err
 }
 
-// fetchAndDecode fetches the file of the emote and decodes it according to
-// its animated flag.
+// fetchAndDecode fetches the file of the emote and decodes it by the format
+// of the file instead of the animated flag, because the animated flag is not
+// known for the emotes of irc tags: the twitch cdn serves png files for
+// static and gif files for animated emotes, 7tv serves webp and gif. Gif
+// files decode into their animation and the still image of their first
+// frame.
 func (c *emoteCache) fetchAndDecode(emote *hasherino.Emote) (image.Image, *gifAnimation, error) {
 	data, fromDisk, err := c.emoteFile(emote)
 	if err != nil {
@@ -224,16 +230,21 @@ func (c *emoteCache) fetchAndDecode(emote *hasherino.Emote) (image.Image, *gifAn
 
 	var img image.Image
 	var animation *gifAnimation
-	if emote.Animated {
+	switch {
+	case isGif(data):
 		var src *gif.GIF
 		src, err = gif.DecodeAll(bytes.NewReader(data))
 		if err == nil {
 			animation = buildAnimation(src)
 			if animation == nil {
 				err = errors.New("gif has no frames")
+			} else {
+				img = animation.frames[0]
 			}
 		}
-	} else {
+	case isPng(data):
+		img, err = png.Decode(bytes.NewReader(data))
+	default:
 		img, err = webp.Decode(bytes.NewReader(data))
 	}
 	if err != nil {
@@ -245,6 +256,16 @@ func (c *emoteCache) fetchAndDecode(emote *hasherino.Emote) (image.Image, *gifAn
 		return nil, nil, err
 	}
 	return img, animation, nil
+}
+
+// isGif reports whether the data starts with the magic bytes of a gif.
+func isGif(data []byte) bool {
+	return len(data) >= 6 && (string(data[:6]) == "GIF87a" || string(data[:6]) == "GIF89a")
+}
+
+// isPng reports whether the data starts with the magic bytes of a png.
+func isPng(data []byte) bool {
+	return len(data) >= 8 && bytes.Equal(data[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
 }
 
 // emoteFile returns the raw file of the emote and whether it was read from the
@@ -322,16 +343,18 @@ func (c *emoteCache) evictLocked() {
 
 // decodedSize estimates how many bytes of memory the decoded emote occupies.
 func decodedSize(img image.Image, animation *gifAnimation) int64 {
-	if img != nil {
-		bounds := img.Bounds()
-		return int64(bounds.Dx()) * int64(bounds.Dy()) * 4
-	}
-	var size int64
 	if animation != nil {
+		// the frames hold the still image of the animation as well
+		var size int64
 		for _, frame := range animation.frames {
 			bounds := frame.Bounds()
 			size += int64(bounds.Dx()) * int64(bounds.Dy()) * 4
 		}
+		return size
 	}
-	return size
+	if img != nil {
+		bounds := img.Bounds()
+		return int64(bounds.Dx()) * int64(bounds.Dy()) * 4
+	}
+	return 0
 }

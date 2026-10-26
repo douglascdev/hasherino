@@ -36,7 +36,8 @@ type Message struct {
 	content         *fyne.Container
 
 	lock         sync.Mutex
-	emotes       map[string]*hasherino.Emote
+	emotes       map[string]*hasherino.Emote // emotes of the channel, replaced by SetEmotes
+	ownEmotes    map[string]*hasherino.Emote // emotes the message itself carries from its irc tags
 	emoteWidgets []EmoteWidget
 	emoteNames   []string
 	emotesLoaded bool
@@ -44,8 +45,10 @@ type Message struct {
 
 // NewMessage creates a message. The authorColor is the hex color of the
 // author's name from the irc tags, an empty or invalid color falls back to
-// the default text color.
-func NewMessage(author string, authorColor string, text string, timestamp time.Time, emotes map[string]*hasherino.Emote, emoteSize fyne.Size, fontSize float32, showMessageTime bool, onEmoteTapped func(string) error) *Message {
+// the default text color. The ownEmotes are the emotes the message itself
+// carries from its irc tags, the emotes are the emotes of the channel the
+// message was sent in.
+func NewMessage(author string, authorColor string, text string, timestamp time.Time, ownEmotes map[string]*hasherino.Emote, emotes map[string]*hasherino.Emote, emoteSize fyne.Size, fontSize float32, showMessageTime bool, onEmoteTapped func(string) error) *Message {
 	message := &Message{
 		author:          author,
 		authorColor:     authorColor,
@@ -55,13 +58,32 @@ func NewMessage(author string, authorColor string, text string, timestamp time.T
 		emoteSize:       emoteSize,
 		fontSize:        fontSize,
 		showMessageTime: showMessageTime,
+		ownEmotes:       ownEmotes,
 		emotes:          emotes,
 		content:         container.New(newMessageLayout(fontSize)),
 	}
 	message.ExtendBaseWidget(message)
-	message.emoteNames = message.matchedEmoteNames(emotes)
-	message.render(emotes)
+	merged := message.emotesFor(emotes)
+	message.emoteNames = message.matchedEmoteNames(merged)
+	message.render(merged)
 	return message
+}
+
+// emotesFor merges the emotes of the channel with the emotes the message
+// itself carries. The own emotes win, because the irc tags mark exactly
+// what twitch rendered as an emote.
+func (m *Message) emotesFor(emotes map[string]*hasherino.Emote) map[string]*hasherino.Emote {
+	if len(m.ownEmotes) == 0 {
+		return emotes
+	}
+	merged := make(map[string]*hasherino.Emote, len(emotes)+len(m.ownEmotes))
+	for name, emote := range emotes {
+		merged[name] = emote
+	}
+	for name, emote := range m.ownEmotes {
+		merged[name] = emote
+	}
+	return merged
 }
 
 func newMessageLayout(fontSize float32) *FlowLayout {
@@ -73,10 +95,12 @@ func (m *Message) CreateRenderer() fyne.WidgetRenderer {
 	return widget.NewSimpleRenderer(m.content)
 }
 
-// SetEmotes rebuilds the message if the emotes it should render changed.
-// It returns true when the message was rebuilt.
+// SetEmotes replaces the emotes of the channel and rebuilds the message if
+// the emotes it should render changed. The emotes the message itself carries
+// are kept. It returns true when the message was rebuilt.
 func (m *Message) SetEmotes(emotes map[string]*hasherino.Emote) bool {
-	names := m.matchedEmoteNames(emotes)
+	merged := m.emotesFor(emotes)
+	names := m.matchedEmoteNames(merged)
 
 	m.lock.Lock()
 	m.emotes = emotes
@@ -92,7 +116,7 @@ func (m *Message) SetEmotes(emotes map[string]*hasherino.Emote) bool {
 	m.lock.Unlock()
 	unloadEmotes(discarded)
 
-	m.render(emotes)
+	m.render(merged)
 
 	if reload {
 		m.LoadEmotes()
@@ -120,7 +144,7 @@ func (m *Message) SetStyle(emoteSize fyne.Size, fontSize float32, showMessageTim
 	unloadEmotes(discarded)
 
 	m.content.Layout = newMessageLayout(fontSize)
-	m.render(emotes)
+	m.render(m.emotesFor(emotes))
 
 	if reload {
 		m.LoadEmotes()

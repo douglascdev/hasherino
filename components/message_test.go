@@ -90,7 +90,7 @@ func TestMessageRendersTextAndEmotes(t *testing.T) {
 
 	emote := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "FeelsDankMan"}
 	emotes := map[string]*hasherino.Emote{emote.Name: emote}
-	message := NewMessage("author", "", "hello FeelsDankMan world", testMessageTime, emotes, testEmoteSize, testFontSize, false, nil)
+	message := NewMessage("author", "", "hello FeelsDankMan world", testMessageTime, nil, emotes, testEmoteSize, testFontSize, false, nil)
 
 	emoteWidgets := 0
 	words := 0
@@ -117,12 +117,67 @@ func TestMessageRendersTextAndEmotes(t *testing.T) {
 	}
 }
 
+func TestMessageRendersItsOwnEmotes(t *testing.T) {
+	app := test.NewApp()
+	defer app.Quit()
+
+	// the emotes tag marks the emotes of the message itself, so they
+	// render even before the emotes of the channel are known
+	kappa := &hasherino.Emote{Id: "25", Source: hasherino.Twitch, Name: "Kappa"}
+	own := map[string]*hasherino.Emote{kappa.Name: kappa}
+	message := NewMessage("author", "", "hello Kappa FeelsDankMan", testMessageTime, own, nil, testEmoteSize, testFontSize, false, nil)
+
+	if len(message.emoteWidgets) != 1 {
+		t.Fatalf("expected the own emote to render, got %d emotes", len(message.emoteWidgets))
+	}
+
+	// channel emotes arriving later render next to the own emote
+	feels := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "FeelsDankMan"}
+	channel := map[string]*hasherino.Emote{feels.Name: feels}
+	if !message.SetEmotes(channel) {
+		t.Fatal("expected the message to be rebuilt when a channel emote arrives")
+	}
+	if len(message.emoteWidgets) != 2 {
+		t.Fatalf("expected the own and the channel emote to render, got %d emotes", len(message.emoteWidgets))
+	}
+
+	// the channel emotes going away keeps the own emote
+	if !message.SetEmotes(nil) {
+		t.Fatal("expected the message to be rebuilt when the channel emotes go away")
+	}
+	if len(message.emoteWidgets) != 1 {
+		t.Fatalf("expected the own emote to stay, got %d emotes", len(message.emoteWidgets))
+	}
+}
+
+func TestMessageOwnEmotesWinOverChannelEmotes(t *testing.T) {
+	app := test.NewApp()
+	defer app.Quit()
+
+	// the irc tags mark exactly what twitch rendered as an emote, so a
+	// channel emote of the same name must not replace them
+	tagKappa := &hasherino.Emote{Id: "25", Source: hasherino.Twitch, Name: "Kappa"}
+	channelKappa := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "Kappa"}
+	message := NewMessage("author", "", "Kappa", testMessageTime,
+		map[string]*hasherino.Emote{tagKappa.Name: tagKappa},
+		map[string]*hasherino.Emote{channelKappa.Name: channelKappa},
+		testEmoteSize, testFontSize, false, nil)
+
+	widget, ok := message.emoteWidgets[0].(*WebpWidget)
+	if !ok {
+		t.Fatalf("expected a webp widget, got %T", message.emoteWidgets[0])
+	}
+	if widget.emote != tagKappa {
+		t.Error("expected the own emote to win over the channel emote")
+	}
+}
+
 func TestMessageSetEmotesOnlyRebuildsOnChange(t *testing.T) {
 	app := test.NewApp()
 	defer app.Quit()
 
 	emote := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "FeelsDankMan"}
-	message := NewMessage("author", "", "hello FeelsDankMan", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+	message := NewMessage("author", "", "hello FeelsDankMan", testMessageTime, nil, nil, testEmoteSize, testFontSize, false, nil)
 
 	if len(message.emoteWidgets) != 0 {
 		t.Errorf("expected no emotes to be rendered, got %d", len(message.emoteWidgets))
@@ -144,7 +199,7 @@ func TestMessageSetStyleOnlyRebuildsOnChange(t *testing.T) {
 
 	emote := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Name: "FeelsDankMan"}
 	emotes := map[string]*hasherino.Emote{emote.Name: emote}
-	message := NewMessage("author", "", "hello FeelsDankMan", testMessageTime, emotes, testEmoteSize, testFontSize, false, nil)
+	message := NewMessage("author", "", "hello FeelsDankMan", testMessageTime, nil, emotes, testEmoteSize, testFontSize, false, nil)
 
 	if message.SetStyle(testEmoteSize, testFontSize, false) {
 		t.Error("expected message not to be rebuilt when the style did not change")
@@ -185,7 +240,7 @@ func TestMessageSizesEmotesByHeight(t *testing.T) {
 	wide := &hasherino.Emote{Id: "wide", Source: hasherino.SevenTV, Name: "wide", Width: 224, Height: 112}
 	tall := &hasherino.Emote{Id: "tall", Source: hasherino.SevenTV, Name: "tall", Width: 112, Height: 224}
 	emotes := map[string]*hasherino.Emote{wide.Name: wide, tall.Name: tall}
-	message := NewMessage("author", "", "wide tall", testMessageTime, emotes, testEmoteSize, testFontSize, false, nil)
+	message := NewMessage("author", "", "wide tall", testMessageTime, nil, emotes, testEmoteSize, testFontSize, false, nil)
 
 	// emotes keep their aspect ratio, capped by the emote height, instead
 	// of being squeezed into a square
@@ -201,7 +256,7 @@ func TestMessageColorsAuthorWithIrcColor(t *testing.T) {
 	app := test.NewApp()
 	defer app.Quit()
 
-	message := NewMessage("author", "#FF4500", "hello", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+	message := NewMessage("author", "#FF4500", "hello", testMessageTime, nil, nil, testEmoteSize, testFontSize, false, nil)
 
 	author, ok := message.content.Objects[0].(*canvas.Text)
 	if !ok {
@@ -218,7 +273,7 @@ func TestMessageFallsBackToDefaultAuthorColor(t *testing.T) {
 	defer app.Quit()
 
 	for _, authorColor := range []string{"", "#GGGGGG", "#FF45"} {
-		message := NewMessage("author", authorColor, "hello", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+		message := NewMessage("author", authorColor, "hello", testMessageTime, nil, nil, testEmoteSize, testFontSize, false, nil)
 
 		author, ok := message.content.Objects[0].(*canvas.Text)
 		if !ok {
@@ -235,7 +290,7 @@ func TestMessageRendersTimeBeforeAuthorWhenEnabled(t *testing.T) {
 	defer app.Quit()
 
 	timestamp := time.Unix(3600*15+120, 0).UTC()
-	message := NewMessage("author", "", "hello", timestamp, nil, testEmoteSize, testFontSize, true, nil)
+	message := NewMessage("author", "", "hello", timestamp, nil, nil, testEmoteSize, testFontSize, true, nil)
 
 	if len(message.content.Objects) != 3 {
 		t.Fatalf("expected the message time, author and word, got %d objects", len(message.content.Objects))
@@ -263,7 +318,7 @@ func TestMessageWrapsWhenNarrow(t *testing.T) {
 	app := test.NewApp()
 	defer app.Quit()
 
-	message := NewMessage("author", "", "a fairly long message that has to wrap over multiple lines", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+	message := NewMessage("author", "", "a fairly long message that has to wrap over multiple lines", testMessageTime, nil, nil, testEmoteSize, testFontSize, false, nil)
 
 	message.Resize(fyne.NewSize(500, 10))
 	wide := message.MinSize().Height
@@ -328,7 +383,7 @@ func TestMessageLoadEmotesLoadsEmotesConcurrently(t *testing.T) {
 	defer app.Quit()
 
 	first, second := newBlockingEmoteWidget(), newBlockingEmoteWidget()
-	message := NewMessage("author", "", "hello", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+	message := NewMessage("author", "", "hello", testMessageTime, nil, nil, testEmoteSize, testFontSize, false, nil)
 	message.emoteWidgets = []EmoteWidget{first, second}
 
 	message.LoadEmotes()
@@ -365,7 +420,7 @@ func TestMessageLoadEmotesUnloadsEmotesThatFinishAfterUnload(t *testing.T) {
 	defer app.Quit()
 
 	emote := newBlockingEmoteWidget()
-	message := NewMessage("author", "", "hello", testMessageTime, nil, testEmoteSize, testFontSize, false, nil)
+	message := NewMessage("author", "", "hello", testMessageTime, nil, nil, testEmoteSize, testFontSize, false, nil)
 	message.emoteWidgets = []EmoteWidget{emote}
 
 	message.LoadEmotes()
