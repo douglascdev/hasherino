@@ -162,6 +162,69 @@ func TestSearchEmotesRanksFiltersAndLimits(t *testing.T) {
 	}
 }
 
+func TestSearchEmotesBySourceFiltersAndScopesOwners(t *testing.T) {
+	hc := newSearchEmoteController(t)
+	if err := hc.permDB.Create(&Account{Id: "account", Active: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := hc.permDB.Create(&Tab{Id: "tab", Login: "channel", Selected: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// the twitch emotes an account can use are owned by it, like the ones
+	// loaded from helix
+	chatUsers := []ChatUser{
+		{Id: "account", Login: "account"},
+		{Id: "someone-else", Login: "someone-else"},
+	}
+	if err := hc.memDB.Create(&chatUsers).Error; err != nil {
+		t.Fatal(err)
+	}
+	otherChannel := "other-channel"
+	emotes := []Emote{
+		{Id: "1", Source: Twitch, Name: "Kappa", OwnerID: "account"},
+		{Id: "2", Source: Twitch, Name: "HypeLol", OwnerID: "account", Animated: true},
+		{Id: "3", Source: SevenTV, Name: "FeelsDankMan"},
+		{Id: "4", Source: SevenTV, Name: "Elsewhere", ChannelID: &otherChannel},
+		{Id: "5", Source: Twitch, Name: "SomeoneElses", OwnerID: "someone-else"},
+	}
+	if err := hc.memDB.Create(&emotes).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	names := func(emotes []*Emote) []string {
+		result := make([]string, 0, len(emotes))
+		for _, emote := range emotes {
+			result = append(result, emote.Name)
+		}
+		return result
+	}
+
+	twitch, err := hc.SearchEmotesBySource(Twitch, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := names(twitch), []string{"HypeLol", "Kappa"}; !slices.Equal(got, want) {
+		t.Fatalf("unexpected twitch emotes: got %v, want %v", got, want)
+	}
+
+	stv, err := hc.SearchEmotesBySource(SevenTV, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := names(stv), []string{"FeelsDankMan"}; !slices.Equal(got, want) {
+		t.Fatalf("unexpected 7tv emotes: got %v, want %v", got, want)
+	}
+
+	all, err := hc.SearchEmotes("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := names(all), []string{"FeelsDankMan", "HypeLol", "Kappa"}; !slices.Equal(got, want) {
+		t.Fatalf("unexpected emotes of every source: got %v, want %v", got, want)
+	}
+}
+
 func TestSearchEmotesEscapesLikeWildcards(t *testing.T) {
 	hc := newSearchEmoteController(t)
 	if err := hc.permDB.Create(&Account{Id: "account", Active: true}).Error; err != nil {

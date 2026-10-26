@@ -28,6 +28,10 @@ type HasherinoController struct {
 	writeWS     *TwitchChatWebsocket
 	memDB       *gorm.DB
 	permDB      *gorm.DB
+	// userEmotesLock and userEmotesLoadedId guard that the twitch emotes of
+	// an account are only loaded once per run
+	userEmotesLock     sync.Mutex
+	userEmotesLoadedId string
 }
 
 func (hc *HasherinoController) New(callbackMap map[string]func(ChatMessage)) (*HasherinoController, error) {
@@ -410,10 +414,22 @@ func (hc *HasherinoController) GetEmotes(search string) ([]*Emote, error) {
 	return hc.SearchEmotes(search, 0)
 }
 
-// SearchEmotes returns emotes matching the search for the selected tab. Exact
-// matches come first, followed by prefix matches and then substring matches.
-// A non-positive limit returns every match.
+// SearchEmotes returns emotes of every source matching the search for the
+// selected tab. Exact matches come first, followed by prefix matches and
+// then substring matches. A non-positive limit returns every match.
 func (hc *HasherinoController) SearchEmotes(search string, limit int) ([]*Emote, error) {
+	return hc.searchEmotes(nil, search, limit)
+}
+
+// SearchEmotesBySource returns emotes of the given source matching the
+// search for the selected tab, like the twitch emotes of the emote picker.
+// Exact matches come first, followed by prefix matches and then substring
+// matches. A non-positive limit returns every match.
+func (hc *HasherinoController) SearchEmotesBySource(source EmoteSourceEnum, search string, limit int) ([]*Emote, error) {
+	return hc.searchEmotes(&source, search, limit)
+}
+
+func (hc *HasherinoController) searchEmotes(source *EmoteSourceEnum, search string, limit int) ([]*Emote, error) {
 	emotes := []*Emote{}
 	err := hc.memDB.Transaction(func(tx *gorm.DB) error {
 		tab := &Tab{}
@@ -429,12 +445,17 @@ func (hc *HasherinoController) SearchEmotes(search string, limit int) ([]*Emote,
 
 		escaped := escapeLikePattern(search)
 		query := `(owner_id = ? OR owner_id = '') AND (channel_id = ? OR channel_id IS NULL) AND name LIKE ? ESCAPE '\'`
+		vars := []interface{}{activeAccount.Id, tab.Id, "%" + escaped + "%"}
+		if source != nil {
+			query += ` AND source = ?`
+			vars = append(vars, *source)
+		}
 		order := clause.OrderBy{Expression: clause.Expr{
 			SQL:  `CASE WHEN name = ? COLLATE NOCASE THEN 0 WHEN name LIKE ? ESCAPE '\' THEN 1 ELSE 2 END, name COLLATE NOCASE`,
 			Vars: []interface{}{search, escaped + "%"},
 		}}
 
-		result = tx.Where(query, activeAccount.Id, tab.Id, "%"+escaped+"%").Order(order)
+		result = tx.Where(query, vars...).Order(order)
 		if limit > 0 {
 			result = result.Limit(limit)
 		}
@@ -553,9 +574,66 @@ func (hc *HasherinoController) GetSelectedTab() (*Tab, error) {
 	return tab, result.Error
 }
 
+// loadUserEmotes loads the twitch emotes the account can use, like its
+// global and subscription emotes, once per account per run. The emotes are
+// owned by the account, so they only turn up in the searches of the account
+// that can use them.
+func (hc *HasherinoController) loadUserEmotes(account *Account) {
+	hc.userEmotesLock.Lock()
+	defer hc.userEmotesLock.Unlock()
+	if hc.userEmotesLoadedId == account.Id {
+		return
+	}
+
+	helix := NewHelix(hc.appId)
+	userEmotes, err := helix.GetUserEmotes(account.Token, account.Id)
+	if err != nil {
+		log.Printf("Failed to load twitch user emotes: %s", err)
+		return
+	}
+
+	emoteObjs := []Emote{}
+	for _, emote := range *userEmotes {
+		emoteObjs = append(emoteObjs, Emote{
+			Id:        emote.ID,
+			Source:    Twitch,
+			Name:      emote.Name,
+			Animated:  emote.Animated(),
+			Width:     0,
+			Height:    0,
+			ChannelID: nil,
+			OwnerID:   account.Id,
+		})
+	}
+
+	err = hc.memDB.Transaction(func(tx *gorm.DB) error {
+		// the account is the owner of its emotes, so they need a chat user
+		// row to reference
+		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&ChatUser{
+			Id:          account.Id,
+			Login:       account.Login,
+			DisplayName: account.DisplayName,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if len(emoteObjs) == 0 {
+			return nil
+		}
+		return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&emoteObjs).Error
+	})
+	if err != nil {
+		log.Printf("Failed to save twitch user emotes: %s", err)
+		return
+	}
+	hc.userEmotesLoadedId = account.Id
+	log.Println("Loaded " + strconv.Itoa(len(emoteObjs)) + " twitch user emotes for " + account.Login)
+}
+
 func (hc *HasherinoController) Listen() error {
 	activeAccount, err := hc.GetActiveAccount()
 	if err == nil {
+		go hc.loadUserEmotes(activeAccount)
 		if hc.writeWS == nil || hc.writeWS.State == Disconnected {
 			hc.writeWS, err = hc.writeWS.New("oauth:"+activeAccount.Token, activeAccount.Login)
 			if err != nil {

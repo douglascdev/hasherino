@@ -9,6 +9,8 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/url"
+	"slices"
 	"strconv"
 	"time"
 
@@ -48,7 +50,7 @@ func (t *TwitchOAuth) OpenOAuthPage(app_id string) {
 		"client_id":     app_id,
 		"redirect_uri":  "http://localhost:17563",
 		"response_type": "token",
-		"scope":         "chat:edit chat:read user:manage:chat_color",
+		"scope":         "chat:edit chat:read user:manage:chat_color user:read:emotes",
 		"state":         t.state,
 	}
 	headersStr := ""
@@ -269,6 +271,87 @@ func GetChatHistory(channel string, limit int) (*[]ChatMessage, error) {
 	}
 
 	return &messages, nil
+}
+
+// HelixUserEmote is one emote the user can use, like a global emote or one
+// of its subscriptions.
+type HelixUserEmote struct {
+	EmoteSetID string   `json:"emote_set_id"`
+	EmoteType  string   `json:"emote_type"`
+	Format     []string `json:"format"`
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	OwnerID    string   `json:"owner_id"`
+	Scale      []string `json:"scale"`
+	ThemeMode  []string `json:"theme_mode"`
+}
+
+// Animated reports whether the emote has an animated format.
+func (e *HelixUserEmote) Animated() bool {
+	return slices.Contains(e.Format, "animated")
+}
+
+// HelixUserEmotes is one page of the emotes a user can use.
+type HelixUserEmotes struct {
+	Data       []HelixUserEmote `json:"data"`
+	Template   string           `json:"template"`
+	Pagination struct {
+		Cursor string `json:"cursor"`
+	} `json:"pagination"`
+}
+
+// maxUserEmotePages limits how many pages of user emotes are followed, so a
+// broken cursor cannot loop the requests forever.
+const maxUserEmotePages = 10
+
+// GetUserEmotes returns every emote the user can use, like global emotes and
+// the emotes of its subscriptions, following the pagination of the helix
+// chat emotes endpoint.
+func (h *Helix) GetUserEmotes(token string, userId string) (*[]HelixUserEmote, error) {
+	emotes := []HelixUserEmote{}
+	cursor := ""
+	for range maxUserEmotePages {
+		requestUrl := "https://api.twitch.tv/helix/chat/emotes/user?user_id=" + userId
+		if cursor != "" {
+			requestUrl += "&after=" + url.QueryEscape(cursor)
+		}
+
+		req, err := http.NewRequest("GET", requestUrl, nil)
+		if err != nil {
+			log.Printf("Failed to create request for the emotes of user %s with error %s", userId, err)
+			return nil, err
+		}
+		req.Header.Add("Authorization", "Bearer "+token)
+		req.Header.Add("Client-Id", h.appId)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Printf("Failed to get the emotes of user %s with error %s", userId, err)
+			return nil, err
+		}
+		log.Printf("User emotes status code: %d", resp.StatusCode)
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			log.Printf("Failed to read response body: %s", readErr)
+			return nil, readErr
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("failed to get the emotes of user %s: %s", userId, resp.Status)
+		}
+
+		var emotesPage HelixUserEmotes
+		if err := json.Unmarshal(body, &emotesPage); err != nil {
+			log.Printf("Failed to unmarshal response body: %s", err)
+			return nil, err
+		}
+		emotes = append(emotes, emotesPage.Data...)
+		cursor = emotesPage.Pagination.Cursor
+		if cursor == "" {
+			break
+		}
+	}
+	return &emotes, nil
 }
 
 // STVFile is one file variant of a 7tv emote, e.g. its 2x webp.

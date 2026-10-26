@@ -359,6 +359,7 @@ func NewChatTab(
 	channel string,
 	sendMsg func(string) error,
 	searchEmotes func(string, int) ([]*hasherino.Emote, error),
+	searchEmotesBySource func(hasherino.EmoteSourceEnum, string, int) ([]*hasherino.Emote, error),
 	getChannelEmotes func(string) ([]*hasherino.Emote, error),
 	window fyne.Window,
 	settingsFunc func() (*hasherino.AppSettings, error),
@@ -483,13 +484,10 @@ func NewChatTab(
 		newWindow.Resize(fyne.NewSize(300, 600))
 		newWindow.SetContent(container.NewCenter(widget.NewLabel("Loading...")))
 
-		loadEmoteSearch := func(search string) (*widget.Accordion, error) {
-			emotes, err := searchEmotes(search, emotePickerLimit)
-			if err != nil {
-				dialog.ShowError(err, window)
-				return nil, err
-			}
-
+		// newEmoteScroll builds the scrollable emote grid of one section of
+		// the emote picker. It returns the scroll and the animated emotes of
+		// the grid, so they can be stopped when the picker closes.
+		newEmoteScroll := func(emotes []*hasherino.Emote) (*container.Scroll, []*components.EmoteGif) {
 			var images []fyne.CanvasObject
 			var animatedEmotes []*components.EmoteGif
 			mutex := sync.Mutex{}
@@ -527,21 +525,14 @@ func NewChatTab(
 					}
 				}(emoteSlice)
 			}
-			newWindow.SetOnClosed(func() {
-				for _, emote := range animatedEmotes {
-					go func(emote *components.EmoteGif) {
-						emote.Stop()
-					}(emote)
-				}
-			})
 			wg.Wait()
 			grid := container.NewGridWrap(defaultEmoteSize, images...)
-			stvScroll := container.NewScroll(grid)
-			stvScroll.OnScrolled = func(scrollOffset fyne.Position) {
+			emoteScroll := container.NewScroll(grid)
+			emoteScroll.OnScrolled = func(scrollOffset fyne.Position) {
 				for _, comp := range images {
 					go func(comp fyne.CanvasObject) {
 						w := comp.(components.LazyLoadedWidget)
-						scrollSize := stvScroll.Size()
+						scrollSize := emoteScroll.Size()
 						widgetPos := w.Position()
 						widgetSize := w.Size()
 						isVisible := widgetPos.Y+widgetSize.Height > scrollOffset.Y &&
@@ -554,21 +545,47 @@ func NewChatTab(
 					}(comp)
 				}
 			}
-			// Load the first 60 images
-			// TODO: work for each accordion item
-			start, end := 0, min(60, len(images))
-			for i := start; i < end; i++ {
+			// load the first images of the grid, the rest loads on scrolling
+			for i := range min(60, len(images)) {
 				go func(i int) {
 					images[i].(components.LazyLoadedWidget).LazyLoad()
 				}(i)
 			}
+			return emoteScroll, animatedEmotes
+		}
+
+		loadEmoteSearch := func(search string) (*widget.Accordion, error) {
+			twitchEmotes, err := searchEmotesBySource(hasherino.Twitch, search, emotePickerLimit)
+			if err != nil {
+				dialog.ShowError(err, window)
+				return nil, err
+			}
+			stvEmotes, err := searchEmotesBySource(hasherino.SevenTV, search, emotePickerLimit)
+			if err != nil {
+				dialog.ShowError(err, window)
+				return nil, err
+			}
+
+			twitchScroll, twitchAnimated := newEmoteScroll(twitchEmotes)
+			stvScroll, stvAnimated := newEmoteScroll(stvEmotes)
+			animatedEmotes := append(twitchAnimated, stvAnimated...)
+
+			newWindow.SetOnClosed(func() {
+				for _, emote := range animatedEmotes {
+					go func(emote *components.EmoteGif) {
+						emote.Stop()
+					}(emote)
+				}
+			})
+
 			accordion := widget.NewAccordion(
-				widget.NewAccordionItem("Twitch Emotes", widget.NewLabel("Not implemented")),
+				widget.NewAccordionItem("Twitch Emotes"+strings.Repeat(" ", 80), twitchScroll),
 				widget.NewAccordionItem("7TV Emotes"+strings.Repeat(" ", 80), stvScroll),
 				widget.NewAccordionItem("FFZ Emotes", widget.NewLabel("Not implemented")),
 				widget.NewAccordionItem("BTTV Emotes", widget.NewLabel("Not implemented")),
 				widget.NewAccordionItem("Emoji", widget.NewLabel("Not implemented")),
 			)
+			accordion.Items[0].Open = true
 			accordion.Items[1].Open = true
 			return accordion, nil
 		}
@@ -657,7 +674,7 @@ func main() {
 
 		for _, tab := range savedTabs {
 			tabIds = append(tabIds, tab.Id)
-			newTab := NewChatTab(tab.Login, sendMessage, hc.SearchEmotes, hc.GetChannelEmotes, w, hc.GetSettings)
+			newTab := NewChatTab(tab.Login, sendMessage, hc.SearchEmotes, hc.SearchEmotesBySource, hc.GetChannelEmotes, w, hc.GetSettings)
 			chatTabs.Append(newTab)
 			if err == nil && selectedTab.Login == tab.Login {
 				chatTabs.Select(newTab)
@@ -689,7 +706,7 @@ func main() {
 						if err != nil {
 							dialog.ShowError(err, w)
 						} else {
-							chatTabs.Append(NewChatTab(channel, sendMessage, hc.SearchEmotes, hc.GetChannelEmotes, w, hc.GetSettings))
+							chatTabs.Append(NewChatTab(channel, sendMessage, hc.SearchEmotes, hc.SearchEmotesBySource, hc.GetChannelEmotes, w, hc.GetSettings))
 							newTabDialog.Hide()
 						}
 					}
