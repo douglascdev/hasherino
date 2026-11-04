@@ -5,10 +5,10 @@ import (
 	"errors"
 	"io"
 	"log"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -707,16 +707,10 @@ func (hc *HasherinoController) SetSettings(appSettings *AppSettings) error {
 }
 
 func GetDataFolder() (string, error) {
-	home, err := os.UserHomeDir()
+	dir, err := os.UserConfigDir()
+	slog.Info("user data dir", slog.String("dir", dir))
 	if err != nil {
 		return "", err
 	}
-	switch runtime.GOOS {
-	case "windows":
-		return filepath.Join(home, "AppData", "Local", "Hasherino"), nil
-	case "linux":
-		return filepath.Join(home, ".local", "share", "hasherino"), nil
-	default:
-		return home, nil
-	}
+	return path.Join(dir, "hasherino"), nil
 }
