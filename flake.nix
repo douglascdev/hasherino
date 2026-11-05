@@ -31,6 +31,11 @@
             libXxf86vm
             libxkbcommon
             wayland
+
+            # gio
+            vulkan-loader
+            vulkan-headers
+            libxcb
           ];
 
           CGO_ENABLED = "1";
