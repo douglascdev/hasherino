@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-ai-jail --network --x11 \
+ai-jail --network --terminal-passthrough --x11 \
   --map "$XDG_RUNTIME_DIR" \
   --rw-map /tmp \
   --env NIX_LDFLAGS \
