@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,19 +67,55 @@ type chatMedia struct {
 }
 
 type chat struct {
-	list     widget.List
-	mu       sync.Mutex
-	messages []chatMessage
+	list        widget.List
+	mu          sync.Mutex
+	messages    []chatMessage
+	limit       int
+	scrollToEnd bool
 }
 
-const maxChatMessages = 500
+const defaultChatMessageLimit = 500
+
+func (c *chat) setLimit(limit int) {
+	if limit <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.limit = limit
+	if len(c.messages) > limit {
+		c.messages = c.messages[len(c.messages)-limit:]
+	}
+}
+
+// requestScrollToEnd asks the chat to scroll to its last message the next
+// time it is laid out.
+func (c *chat) requestScrollToEnd() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.scrollToEnd = true
+}
+
+// takeScrollToEnd reports and clears a pending scroll-to-end request.
+func (c *chat) takeScrollToEnd() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.scrollToEnd {
+		return false
+	}
+	c.scrollToEnd = false
+	return true
+}
 
 func (c *chat) append(message chatMessage) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.limit <= 0 {
+		c.limit = defaultChatMessageLimit
+	}
 	c.messages = append(c.messages, message)
-	if len(c.messages) > maxChatMessages {
-		c.messages = c.messages[len(c.messages)-maxChatMessages:]
+	if len(c.messages) > c.limit {
+		c.messages = c.messages[len(c.messages)-c.limit:]
 	}
 }
 
@@ -315,6 +352,49 @@ func registerTabCallback(window *app.Window, callbackMap map[string]func(hasheri
 	}
 }
 
+// loadChatHistory fills the tab's chat with the channel's recent messages.
+// It respects the ChatHistory setting and the ChatMessageLimit from the
+// controller's settings.
+func loadChatHistory(window *app.Window, hc *hasherino.HasherinoController, tab *tabItem) {
+	go func() {
+		settings, err := hc.GetSettings()
+		if err != nil {
+			log.Printf("failed to load settings for chat history: %s", err)
+			return
+		}
+		if !settings.ChatHistory {
+			return
+		}
+
+		limit := settings.ChatMessageLimit
+		if limit <= 0 {
+			limit = 100
+		}
+		tab.chat.setLimit(limit)
+
+		history, err := hasherino.GetChatHistory(tab.login, limit)
+		if err != nil {
+			log.Printf("failed to load chat history for %s: %s", tab.login, err)
+			return
+		}
+
+		messages := *history
+		sort.Slice(messages, func(i, j int) bool {
+			return messages[i].Time.Before(messages[j].Time)
+		})
+
+		chat := tab.chat
+		for _, message := range messages {
+			chat.append(chatMessage{
+				text:  message.Author + ": " + message.Text,
+				color: parseHexColor(message.AuthorColor),
+			})
+		}
+		chat.requestScrollToEnd()
+		window.Invalidate()
+	}()
+}
+
 func parseHexColor(value string) color.NRGBA {
 	defaultColor := color.NRGBA{R: 0xe6, G: 0xe6, B: 0xe6, A: 0xff}
 	value = strings.TrimPrefix(value, "#")
@@ -394,7 +474,7 @@ func layoutFlow(gtx layout.Context, spaceX, spaceY unit.Dp, widgets ...layout.Wi
 func newChat() *chat {
 	var list widget.List
 	list.Axis = layout.Vertical
-	return &chat{list: list}
+	return &chat{list: list, limit: defaultChatMessageLimit}
 }
 
 func decodeChatMedia(data []byte) (*chatMedia, error) {
@@ -457,6 +537,10 @@ func (m *chatMedia) frame(now time.Time) (paint.ImageOp, time.Time) {
 func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensions {
 	now := time.Now()
 	messages := c.snapshot()
+	if c.takeScrollToEnd() {
+		c.list.ScrollToEnd = true
+		c.list.Position.BeforeEnd = false
+	}
 	c.list.Gap = gtx.Dp(unit.Dp(8))
 	return layout.Inset{
 		Top:    unit.Dp(8),
@@ -1290,6 +1374,7 @@ func run(window *app.Window) error {
 	for _, saved := range savedTabs {
 		item := newTabItem(saved)
 		registerTabCallback(window, callbackMap, &item)
+		loadChatHistory(window, hc, &item)
 		tabs = append(tabs, item)
 		tabIds = append(tabIds, saved.Id)
 		if selectedLogin != "" && strings.EqualFold(saved.Login, selectedLogin) {
@@ -1359,6 +1444,7 @@ func run(window *app.Window) error {
 					addTab.pending = false
 					item := newTabItem(event.tab)
 					registerTabCallback(window, callbackMap, &item)
+					loadChatHistory(window, hc, &item)
 					tabs = append(tabs, item)
 					selectedTab = len(tabs) - 1
 					if err := hc.SetSelectedTab(item.login); err != nil {
