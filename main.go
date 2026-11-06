@@ -1,14 +1,15 @@
 package main
 
 import (
-	"image/color"
 	"log"
 	"os"
 
 	"gioui.org/app"
+	"gioui.org/layout"
 	"gioui.org/op"
-	"gioui.org/text"
+	"gioui.org/widget"
 	"gioui.org/widget/material"
+	"golang.org/x/exp/shiny/materialdesign/icons"
 )
 
 func main() {
@@ -27,6 +28,13 @@ func main() {
 func run(window *app.Window) error {
 	theme := material.NewTheme()
 	var ops op.Ops
+
+	settingsButton := new(widget.Clickable)
+	settingsIcon, err := widget.NewIcon(icons.ActionSettings)
+	if err != nil {
+		return err
+	}
+
 	for {
 		switch e := window.Event().(type) {
 		case app.DestroyEvent:
@@ -35,18 +43,20 @@ func run(window *app.Window) error {
 			// This graphics context is used for managing the rendering state.
 			gtx := app.NewContext(&ops, e)
 
-			// Define an large label with an appropriate text:
-			title := material.H1(theme, "Hello, Gio")
+			// Handle settings button clicks.
+			if settingsButton.Clicked(gtx) {
+				log.Println("settings clicked")
+			}
 
-			// Change the color of the label.
-			maroon := color.NRGBA{R: 127, G: 0, B: 0, A: 255}
-			title.Color = maroon
-
-			// Change the position of the label.
-			title.Alignment = text.Middle
-
-			// Draw the label to the graphics context.
-			title.Layout(gtx)
+			// Draw the settings button in the top-right corner.
+			layout.Stack{Alignment: layout.NE}.Layout(gtx,
+				layout.Expanded(func(gtx layout.Context) layout.Dimensions {
+					return layout.Dimensions{Size: gtx.Constraints.Max}
+				}),
+				layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+					return material.IconButton(theme, settingsButton, settingsIcon, "Settings").Layout(gtx)
+				}),
+			)
 
 			// Pass the drawing operations to the GPU.
 			e.Frame(gtx.Ops)
