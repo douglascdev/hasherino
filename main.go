@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gioui.org/app"
@@ -68,6 +69,7 @@ type userEntry struct {
 	id     string
 	login  string
 	token  string
+	active bool
 	button widget.Clickable
 }
 
@@ -79,6 +81,7 @@ type usersMenuState struct {
 	add      widget.Clickable
 	remove   widget.Clickable
 	onAdd    func()
+	onRemove func(index int)
 }
 
 type deviceAuthEvent struct {
@@ -97,6 +100,7 @@ type deviceAuthState struct {
 	errText         string
 	events          <-chan deviceAuthEvent
 	cancel          context.CancelFunc
+	onAccount       func(id, login, token string) error
 	backdrop        widget.Clickable
 	openButton      widget.Clickable
 	copyButton      widget.Clickable
@@ -499,6 +503,46 @@ func newUsersMenu() *usersMenuState {
 	return &usersMenuState{selected: -1, next: 1}
 }
 
+func loadSavedUsers(hc *hasherino.HasherinoController, menu *usersMenuState) error {
+	accounts, err := hc.GetAccounts()
+	if err != nil {
+		return err
+	}
+
+	menu.users = menu.users[:0]
+	menu.selected = -1
+	for _, account := range accounts {
+		menu.users = append(menu.users, userEntry{
+			id:     account.Id,
+			login:  account.Login,
+			token:  account.Token,
+			active: account.Active,
+		})
+		if account.Active {
+			menu.selected = len(menu.users) - 1
+		}
+	}
+	if menu.selected < 0 && len(menu.users) > 0 {
+		menu.selected = 0
+	}
+	return nil
+}
+
+func removeUserAt(menu *usersMenuState, index int) {
+	if index < 0 || index >= len(menu.users) {
+		return
+	}
+	menu.users = append(menu.users[:index], menu.users[index+1:]...)
+	switch {
+	case len(menu.users) == 0:
+		menu.selected = -1
+	case menu.selected > index:
+		menu.selected--
+	case menu.selected >= len(menu.users):
+		menu.selected = len(menu.users) - 1
+	}
+}
+
 func startDeviceAuth(window *app.Window, clientID, scopes string) (<-chan deviceAuthEvent, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	events := make(chan deviceAuthEvent, 4)
@@ -576,6 +620,12 @@ func (a *deviceAuthState) apply(event deviceAuthEvent, menu *usersMenuState) {
 	case event.token != nil:
 		a.pending = false
 		if event.login != "" {
+			if a.onAccount != nil {
+				if err := a.onAccount(event.id, event.login, event.token.AccessToken); err != nil {
+					a.errText = fmt.Sprintf("Could not save %s: %s", event.login, err)
+					return
+				}
+			}
 			selectOrAddUser(menu, event.id, event.login, event.token.AccessToken)
 			menu.open = false
 		}
@@ -597,15 +647,24 @@ func (a *deviceAuthState) close() {
 }
 
 func selectOrAddUser(menu *usersMenuState, id, login, token string) {
+	anyActive := false
 	for i := range menu.users {
-		if menu.users[i].login == login {
+		if menu.users[i].active {
+			anyActive = true
+			break
+		}
+	}
+	for i := range menu.users {
+		if menu.users[i].id == id || (menu.users[i].id == "" && menu.users[i].login == login) {
 			menu.users[i].id = id
+			menu.users[i].login = login
 			menu.users[i].token = token
+			menu.users[i].active = menu.users[i].active || !anyActive
 			menu.selected = i
 			return
 		}
 	}
-	menu.users = append(menu.users, userEntry{id: id, login: login, token: token})
+	menu.users = append(menu.users, userEntry{id: id, login: login, token: token, active: !anyActive})
 	menu.selected = len(menu.users) - 1
 }
 
@@ -639,12 +698,10 @@ func layoutUsersMenu(gtx layout.Context, theme *material.Theme, state *usersMenu
 		}
 	}
 	if state.remove.Clicked(gtx) && state.selected >= 0 && state.selected < len(state.users) {
-		state.users = append(state.users[:state.selected], state.users[state.selected+1:]...)
-		switch {
-		case len(state.users) == 0:
-			state.selected = -1
-		case state.selected >= len(state.users):
-			state.selected = len(state.users) - 1
+		if state.onRemove != nil {
+			state.onRemove(state.selected)
+		} else {
+			removeUserAt(state, state.selected)
 		}
 	}
 
@@ -896,6 +953,13 @@ func run(window *app.Window) error {
 	}
 	var ops op.Ops
 
+	callbackMap := make(map[string]func(hasherino.ChatMessage))
+	hc := &hasherino.HasherinoController{}
+	hc, err := hc.New(callbackMap)
+	if err != nil {
+		return err
+	}
+
 	settingsButton := new(widget.Clickable)
 	settingsIcon, err := widget.NewIcon(icons.ActionSettings)
 	if err != nil {
@@ -919,7 +983,34 @@ func run(window *app.Window) error {
 	usersStyle.Inset = layout.UniformInset(8)
 
 	usersMenu := newUsersMenu()
+	if err := loadSavedUsers(hc, usersMenu); err != nil {
+		return err
+	}
+
+	var listening atomic.Bool
+	startListening := func() {
+		if !listening.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			if err := hc.Listen(); err != nil {
+				log.Printf("failed to connect: %s", err)
+				listening.Store(false)
+			}
+		}()
+	}
+	if len(usersMenu.users) > 0 {
+		startListening()
+	}
+
 	deviceAuth := &deviceAuthState{}
+	deviceAuth.onAccount = func(id, login, token string) error {
+		if err := hc.UpsertAccount(id, login, token); err != nil {
+			return err
+		}
+		startListening()
+		return nil
+	}
 	usersMenu.onAdd = func() {
 		if deviceAuth.open {
 			return
@@ -930,6 +1021,28 @@ func run(window *app.Window) error {
 		deviceAuth.verificationURI = ""
 		deviceAuth.errText = ""
 		deviceAuth.events, deviceAuth.cancel = startDeviceAuth(window, deviceClientID, hasherino.TwitchOAuthScopes)
+	}
+	usersMenu.onRemove = func(index int) {
+		if index < 0 || index >= len(usersMenu.users) {
+			return
+		}
+		entry := usersMenu.users[index]
+		wasActive := entry.active
+		if entry.id == "" {
+			removeUserAt(usersMenu, index)
+			if wasActive {
+				listening.Store(false)
+			}
+			return
+		}
+		if err := hc.RemoveAccount(entry.id); err != nil {
+			log.Printf("failed to remove account %s: %s", entry.login, err)
+			return
+		}
+		removeUserAt(usersMenu, index)
+		if wasActive {
+			listening.Store(false)
+		}
 	}
 	userAddIcon, err := widget.NewIcon(icons.SocialPersonAdd)
 	if err != nil {

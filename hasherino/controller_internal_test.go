@@ -86,6 +86,52 @@ func TestAddAccountActivatesWhenNoActiveAccount(t *testing.T) {
 	}
 }
 
+func TestUpsertAccountUpdatesTokenAndKeepsActiveState(t *testing.T) {
+	hc := newSearchEmoteController(t)
+	if err := hc.UpsertAccount("id", "login", "token1"); err != nil {
+		t.Fatalf("UpsertAccount failed: %v", err)
+	}
+
+	active, err := hc.GetActiveAccount()
+	if err != nil {
+		t.Fatalf("GetActiveAccount failed: %v", err)
+	}
+	if active.Id != "id" || active.Token != "token1" {
+		t.Fatalf("unexpected active account: %+v", active)
+	}
+
+	if err := hc.UpsertAccount("id", "login", "token2"); err != nil {
+		t.Fatalf("UpsertAccount failed: %v", err)
+	}
+
+	active, err = hc.GetActiveAccount()
+	if err != nil {
+		t.Fatalf("GetActiveAccount failed: %v", err)
+	}
+	if active.Token != "token2" {
+		t.Fatalf("expected the token to update, got %q", active.Token)
+	}
+}
+
+func TestUpsertAccountActivatesWhenNoActiveAccount(t *testing.T) {
+	hc := newSearchEmoteController(t)
+	if err := hc.permDB.Create(&Account{Id: "old", Login: "old", Active: false}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := hc.UpsertAccount("old", "old", "token"); err != nil {
+		t.Fatalf("UpsertAccount failed: %v", err)
+	}
+
+	active, err := hc.GetActiveAccount()
+	if err != nil {
+		t.Fatalf("GetActiveAccount failed: %v", err)
+	}
+	if active.Id != "old" {
+		t.Fatalf("unexpected active account: %q", active.Id)
+	}
+}
+
 func TestTwitchChatWebsocketCloseZeroValue(t *testing.T) {
 	(&TwitchChatWebsocket{}).Close()
 }

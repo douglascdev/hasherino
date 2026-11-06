@@ -137,6 +137,39 @@ func (hc *HasherinoController) AddAccount(id string, login string, token string)
 	})
 }
 
+// UpsertAccount saves the account, creating it when needed. An existing
+// account keeps its active state, unless no account is active, in which case
+// this account becomes the active one.
+func (hc *HasherinoController) UpsertAccount(id string, login string, token string) error {
+	return hc.permDB.Transaction(func(tx *gorm.DB) error {
+		account := &Account{}
+		result := tx.Take(account, "Id = ?", id)
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			var activeCount int64
+			if err := tx.Model(&Account{}).Where("Active = ?", true).Count(&activeCount).Error; err != nil {
+				return err
+			}
+			active := activeCount == 0
+			account = &Account{Id: id, Login: login, Token: token, Active: active}
+			return tx.Create(account).Error
+		}
+		if result.Error != nil {
+			return result.Error
+		}
+
+		var activeCount int64
+		if err := tx.Model(&Account{}).Where("Active = ?", true).Count(&activeCount).Error; err != nil {
+			return err
+		}
+		if activeCount == 0 {
+			account.Active = true
+		}
+		account.Login = login
+		account.Token = token
+		return tx.Save(account).Error
+	})
+}
+
 func (hc *HasherinoController) RemoveAccount(id string) error {
 	return hc.permDB.Transaction(func(tx *gorm.DB) error {
 		account := &Account{}

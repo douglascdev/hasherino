@@ -125,9 +125,6 @@ func (w *TwitchChatWebsocket) Listen(callback func(message string)) error {
 		fmt.Println("Message: " + s)
 		callback(s)
 	}
-	w.Close()
-
-	return nil
 }
 
 func (w *TwitchChatWebsocket) Join(channelStrings ...string) error {
