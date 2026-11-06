@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"gioui.org/app"
 	"gioui.org/io/clipboard"
@@ -53,10 +54,11 @@ type chatPart struct {
 }
 
 type chatMessage struct {
-	text  string
-	color color.NRGBA
-	media *chatMedia
-	parts []chatPart
+	author      string
+	authorColor color.NRGBA
+	text        string
+	media       *chatMedia
+	parts       []chatPart
 }
 
 type chatMedia struct {
@@ -183,6 +185,193 @@ type addTabState struct {
 	backdrop     widget.Clickable
 	addButton    widget.Clickable
 	cancelButton widget.Clickable
+}
+
+const (
+	emoteSuggestionLimit = 10
+	emoteSearchDelay     = 200 * time.Millisecond
+	minEmoteQueryLength  = 3
+	maxMessageLength     = 500
+)
+
+type emoteSearchEvent struct {
+	requestID uint64
+	query     string
+	emotes    []*hasherino.Emote
+	err       error
+}
+
+type emoteSuggestionRow struct {
+	emote  *hasherino.Emote
+	button widget.Clickable
+}
+
+type messageInputState struct {
+	editor       widget.Editor
+	sendButton   widget.Clickable
+	suggestions  []*hasherino.Emote
+	rows         []emoteSuggestionRow
+	selected     int
+	visible      bool
+	errText      string
+	lastText     string
+	searchTimer  *time.Timer
+	requestID    uint64
+	searchEvents chan emoteSearchEvent
+}
+
+func newMessageInputState() *messageInputState {
+	state := &messageInputState{
+		searchEvents: make(chan emoteSearchEvent, 1),
+	}
+	state.editor.SingleLine = true
+	return state
+}
+
+func (s *messageInputState) drainSearchEvents() {
+	for {
+		select {
+		case event := <-s.searchEvents:
+			if event.requestID != s.requestID {
+				continue
+			}
+			if event.err != nil {
+				log.Printf("Failed to search emotes for %q: %s", event.query, event.err)
+				s.hideSuggestions()
+				continue
+			}
+			s.showSuggestions(event.emotes)
+		default:
+			return
+		}
+	}
+}
+
+func (s *messageInputState) showSuggestions(emotes []*hasherino.Emote) {
+	suggestions := make([]*hasherino.Emote, 0, len(emotes))
+	for _, emote := range emotes {
+		if emote != nil && emote.Name != "" {
+			suggestions = append(suggestions, emote)
+		}
+	}
+	if len(suggestions) == 0 {
+		s.hideSuggestions()
+		return
+	}
+
+	s.suggestions = suggestions
+	s.rows = make([]emoteSuggestionRow, len(suggestions))
+	for i, suggestion := range suggestions {
+		s.rows[i] = emoteSuggestionRow{emote: suggestion}
+	}
+	if s.selected >= len(suggestions) {
+		s.selected = 0
+	}
+	s.visible = true
+}
+
+func (s *messageInputState) hideSuggestions() {
+	s.cancelSearch()
+	s.suggestions = nil
+	s.rows = nil
+	s.selected = 0
+	s.visible = false
+}
+
+func (s *messageInputState) cancelSearch() {
+	s.requestID++
+	if s.searchTimer != nil {
+		s.searchTimer.Stop()
+		s.searchTimer = nil
+	}
+}
+
+func (s *messageInputState) scheduleSearch(window *app.Window, hc *hasherino.HasherinoController, query string) {
+	s.cancelSearch()
+	requestID := s.requestID
+
+	s.searchTimer = time.AfterFunc(emoteSearchDelay, func() {
+		emotes, err := hc.SearchEmotes(query, emoteSuggestionLimit)
+		s.searchEvents <- emoteSearchEvent{
+			requestID: requestID,
+			query:     query,
+			emotes:    emotes,
+			err:       err,
+		}
+		window.Invalidate()
+	})
+}
+
+func (s *messageInputState) setText(text string) {
+	s.editor.SetText(text)
+	s.lastText = text
+}
+
+func (s *messageInputState) acceptSuggestion(gtx layout.Context, name string) {
+	_, col := s.editor.CaretPos()
+	text, cursor, ok := replaceEmoteToken(s.editor.Text(), col, name)
+	if !ok {
+		s.hideSuggestions()
+		return
+	}
+	s.hideSuggestions()
+	s.setText(text)
+	s.editor.SetCaret(cursor, cursor)
+	gtx.Execute(key.FocusCmd{Tag: &s.editor})
+}
+
+func (s *messageInputState) acceptSelected(gtx layout.Context) {
+	if s.selected < 0 || s.selected >= len(s.suggestions) {
+		s.hideSuggestions()
+		return
+	}
+	s.acceptSuggestion(gtx, s.suggestions[s.selected].Name)
+}
+
+func (s *messageInputState) completeTab(gtx layout.Context, hc *hasherino.HasherinoController) {
+	_, col := s.editor.CaretPos()
+	tokenStart, tokenEnd, query, ok := tabTokenAt(s.editor.Text(), col)
+	if !ok {
+		return
+	}
+
+	s.cancelSearch()
+	emotes, err := hc.SearchEmotes(query, 1)
+	if err != nil {
+		log.Printf("Failed to search emotes for %q: %s", query, err)
+		return
+	}
+	if len(emotes) == 0 || emotes[0] == nil {
+		return
+	}
+
+	text, cursor := replaceToken(s.editor.Text(), tokenStart, tokenEnd, emotes[0].Name)
+	s.hideSuggestions()
+	s.setText(text)
+	s.editor.SetCaret(cursor, cursor)
+	gtx.Execute(key.FocusCmd{Tag: &s.editor})
+}
+
+func (s *messageInputState) send(gtx layout.Context, hc *hasherino.HasherinoController, selectedLogin string) {
+	if selectedLogin == "" {
+		return
+	}
+	text := strings.TrimSpace(s.editor.Text())
+	if text == "" {
+		return
+	}
+	if len([]rune(text)) > maxMessageLength {
+		s.errText = "Message too long"
+		return
+	}
+	if err := hc.SendMessage(selectedLogin, text); err != nil {
+		s.errText = err.Error()
+		return
+	}
+	s.errText = ""
+	s.hideSuggestions()
+	s.setText("")
+	gtx.Execute(key.FocusCmd{Tag: &s.editor})
 }
 
 func (a *addTabState) drain(handle func(addTabEvent)) {
@@ -345,8 +534,9 @@ func registerTabCallback(window *app.Window, callbackMap map[string]func(hasheri
 			return
 		}
 		chat.append(chatMessage{
-			text:  message.Author + ": " + message.Text,
-			color: parseHexColor(message.AuthorColor),
+			author:      message.Author,
+			authorColor: parseHexColor(message.AuthorColor),
+			text:        message.Text,
 		})
 		window.Invalidate()
 	}
@@ -386,8 +576,9 @@ func loadChatHistory(window *app.Window, hc *hasherino.HasherinoController, tab 
 		chat := tab.chat
 		for _, message := range messages {
 			chat.append(chatMessage{
-				text:  message.Author + ": " + message.Text,
-				color: parseHexColor(message.AuthorColor),
+				author:      message.Author,
+				authorColor: parseHexColor(message.AuthorColor),
+				text:        message.Text,
 			})
 		}
 		chat.requestScrollToEnd()
@@ -414,6 +605,261 @@ func parseHexColor(value string) color.NRGBA {
 		B: uint8(parsed),
 		A: 0xff,
 	}
+}
+
+// wordTokenAt returns the range of the word at the cursor position.
+func wordTokenAt(text string, cursor int) (tokenStart, tokenEnd int, ok bool) {
+	runes := []rune(text)
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(runes) {
+		cursor = len(runes)
+	}
+
+	tokenStart = cursor
+	for tokenStart > 0 && !unicode.IsSpace(runes[tokenStart-1]) {
+		tokenStart--
+	}
+	tokenEnd = cursor
+	for tokenEnd < len(runes) && !unicode.IsSpace(runes[tokenEnd]) {
+		tokenEnd++
+	}
+	return tokenStart, tokenEnd, tokenStart != tokenEnd
+}
+
+// emoteTokenAt returns the emote search token at the cursor, the word that
+// starts with the emote search colon, and the query after the colon.
+func emoteTokenAt(text string, cursor int) (tokenStart, tokenEnd int, query string, ok bool) {
+	tokenStart, tokenEnd, ok = wordTokenAt(text, cursor)
+	if !ok {
+		return 0, 0, "", false
+	}
+	runes := []rune(text)
+	if runes[tokenStart] != ':' {
+		return 0, 0, "", false
+	}
+	queryRunes := runes[tokenStart+1 : tokenEnd]
+	if len(queryRunes) < minEmoteQueryLength {
+		return 0, 0, "", false
+	}
+	return tokenStart, tokenEnd, string(queryRunes), true
+}
+
+// tabTokenAt returns the word at the cursor and the query to complete it
+// with, which drops a leading emote search colon.
+func tabTokenAt(text string, cursor int) (tokenStart, tokenEnd int, query string, ok bool) {
+	tokenStart, tokenEnd, ok = wordTokenAt(text, cursor)
+	if !ok {
+		return 0, 0, "", false
+	}
+	runes := []rune(text)
+	queryRunes := runes[tokenStart:tokenEnd]
+	if queryRunes[0] == ':' {
+		queryRunes = queryRunes[1:]
+	}
+	if len(queryRunes) == 0 {
+		return 0, 0, "", false
+	}
+	return tokenStart, tokenEnd, string(queryRunes), true
+}
+
+func replaceEmoteToken(text string, cursor int, name string) (string, int, bool) {
+	tokenStart, tokenEnd, _, ok := emoteTokenAt(text, cursor)
+	if !ok {
+		return text, cursor, false
+	}
+	replaced, replacementCursor := replaceToken(text, tokenStart, tokenEnd, name)
+	return replaced, replacementCursor, true
+}
+
+// replaceToken replaces the token range with the replacement and returns
+// the text and the cursor position after the replacement. A replacement at
+// the end of the text gains a trailing space.
+func replaceToken(text string, tokenStart, tokenEnd int, replacement string) (string, int) {
+	runes := []rune(text)
+	replacementRunes := []rune(replacement)
+	if tokenEnd == len(runes) {
+		replacementRunes = append(replacementRunes, ' ')
+	}
+
+	replaced := make([]rune, 0, len(runes)-(tokenEnd-tokenStart)+len(replacementRunes))
+	replaced = append(replaced, runes[:tokenStart]...)
+	replaced = append(replaced, replacementRunes...)
+	replaced = append(replaced, runes[tokenEnd:]...)
+	return string(replaced), tokenStart + len(replacementRunes)
+}
+
+func layoutMessageInput(gtx layout.Context, theme *material.Theme, state *messageInputState, hc *hasherino.HasherinoController, window *app.Window, selectedLogin string) layout.Dimensions {
+	state.drainSearchEvents()
+	state.handleInputKeys(gtx, hc, selectedLogin)
+	state.updateSearch(gtx, window, hc)
+
+	var inputDims layout.Dimensions
+	return layout.Stack{Alignment: layout.S}.Layout(gtx,
+		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+			inputDims = layoutMessageInputRow(gtx, theme, state, hc, selectedLogin)
+			return inputDims
+		}),
+		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+			if !state.visible || len(state.suggestions) == 0 {
+				return layout.Dimensions{}
+			}
+			offset := op.Offset(image.Pt(0, -(inputDims.Size.Y + gtx.Dp(unit.Dp(8))))).Push(gtx.Ops)
+			dims := layoutEmoteSuggestions(gtx, theme, state)
+			offset.Pop()
+			return dims
+		}),
+	)
+}
+
+func (s *messageInputState) updateSearch(gtx layout.Context, window *app.Window, hc *hasherino.HasherinoController) {
+	text := s.editor.Text()
+	if text == s.lastText {
+		return
+	}
+	s.lastText = text
+
+	_, col := s.editor.CaretPos()
+	_, _, query, ok := emoteTokenAt(text, col)
+	if !ok {
+		s.hideSuggestions()
+		return
+	}
+	s.scheduleSearch(window, hc, query)
+}
+
+func (s *messageInputState) handleInputKeys(gtx layout.Context, hc *hasherino.HasherinoController, selectedLogin string) {
+	s.handleInputKey(gtx, key.NameReturn, hc, selectedLogin)
+	s.handleInputKey(gtx, key.NameEnter, hc, selectedLogin)
+	s.handleInputKey(gtx, key.NameTab, hc, selectedLogin)
+	if s.visible {
+		s.handleInputKey(gtx, key.NameUpArrow, hc, selectedLogin)
+		s.handleInputKey(gtx, key.NameDownArrow, hc, selectedLogin)
+		s.handleInputKey(gtx, key.NameEscape, hc, selectedLogin)
+	}
+}
+
+func (s *messageInputState) handleInputKey(gtx layout.Context, name key.Name, hc *hasherino.HasherinoController, selectedLogin string) {
+	for {
+		event, ok := gtx.Event(key.Filter{Focus: &s.editor, Name: name})
+		if !ok {
+			return
+		}
+		keyEvent, ok := event.(key.Event)
+		if !ok || keyEvent.State != key.Press {
+			continue
+		}
+
+		switch name {
+		case key.NameReturn, key.NameEnter:
+			if s.visible && len(s.suggestions) > 0 {
+				s.acceptSelected(gtx)
+			} else {
+				s.send(gtx, hc, selectedLogin)
+			}
+		case key.NameTab:
+			if s.visible && len(s.suggestions) > 0 {
+				s.acceptSelected(gtx)
+			} else {
+				s.completeTab(gtx, hc)
+			}
+		case key.NameUpArrow:
+			if len(s.suggestions) > 0 {
+				s.selected = (s.selected - 1 + len(s.suggestions)) % len(s.suggestions)
+			}
+		case key.NameDownArrow:
+			if len(s.suggestions) > 0 {
+				s.selected = (s.selected + 1) % len(s.suggestions)
+			}
+		case key.NameEscape:
+			s.hideSuggestions()
+		}
+	}
+}
+
+func layoutMessageInputRow(gtx layout.Context, theme *material.Theme, state *messageInputState, hc *hasherino.HasherinoController, selectedLogin string) layout.Dimensions {
+	if state.sendButton.Clicked(gtx) {
+		state.send(gtx, hc, selectedLogin)
+	}
+
+	return layout.Inset{
+		Top:    unit.Dp(8),
+		Bottom: unit.Dp(8),
+		Left:   unit.Dp(12),
+		Right:  unit.Dp(12),
+	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				editor := material.Editor(theme, &state.editor, "Message")
+				editor.TextSize = unit.Sp(16)
+				return editor.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return material.Button(theme, &state.sendButton, "Send").Layout(gtx)
+			}),
+		)
+	})
+}
+
+func layoutEmoteSuggestions(gtx layout.Context, theme *material.Theme, state *messageInputState) layout.Dimensions {
+	for i := range state.rows {
+		if state.rows[i].button.Clicked(gtx) {
+			state.acceptSuggestion(gtx, state.rows[i].emote.Name)
+			return layout.Dimensions{}
+		}
+	}
+
+	width := gtx.Dp(unit.Dp(240))
+	if width > gtx.Constraints.Max.X {
+		width = gtx.Constraints.Max.X
+	}
+	gtx.Constraints.Min.X = width
+	gtx.Constraints.Max.X = width
+
+	background := func(gtx layout.Context) layout.Dimensions {
+		size := gtx.Constraints.Min
+		radius := gtx.Dp(unit.Dp(8))
+		panel := color.NRGBA{R: 0x1e, G: 0x1e, B: 0x24, A: 0xff}
+		paint.FillShape(gtx.Ops, panel, clip.UniformRRect(image.Rectangle{Max: size}, radius).Op(gtx.Ops))
+		return layout.Dimensions{Size: size}
+	}
+
+	content := func(gtx layout.Context) layout.Dimensions {
+		return layout.Inset{
+			Top:    unit.Dp(4),
+			Bottom: unit.Dp(4),
+			Left:   unit.Dp(4),
+			Right:  unit.Dp(4),
+		}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			children := make([]layout.FlexChild, 0, len(state.rows))
+			for i := range state.rows {
+				i := i
+				row := &state.rows[i]
+				children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return row.button.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{
+							Top:    unit.Dp(4),
+							Bottom: unit.Dp(4),
+							Left:   unit.Dp(8),
+							Right:  unit.Dp(8),
+						}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							label := material.Body1(theme, row.emote.Name)
+							label.Color = theme.Fg
+							if i != state.selected {
+								label.Color.A = 0x99
+							}
+							return label.Layout(gtx)
+						})
+					})
+				}))
+			}
+			return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+		})
+	}
+
+	return layout.Background{}.Layout(gtx, background, content)
 }
 
 type flowItem struct {
@@ -591,9 +1037,22 @@ func layoutChatMessage(gtx layout.Context, theme *material.Theme, message chatMe
 }
 
 func layoutChatText(gtx layout.Context, theme *material.Theme, message chatMessage) layout.Dimensions {
-	label := material.Body1(theme, message.text)
-	label.Color = message.color
-	return label.Layout(gtx)
+	if message.author == "" {
+		label := material.Body1(theme, message.text)
+		label.Color = theme.Fg
+		return label.Layout(gtx)
+	}
+
+	author := material.Body1(theme, message.author+":")
+	author.Color = message.authorColor
+	text := material.Body1(theme, message.text)
+	text.Color = theme.Fg
+
+	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Baseline}.Layout(gtx,
+		layout.Rigid(author.Layout),
+		layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
+		layout.Flexed(1, text.Layout),
+	)
 }
 
 func layoutChatMedia(gtx layout.Context, media *chatMedia, now time.Time) layout.Dimensions {
@@ -618,7 +1077,7 @@ func layoutChatParts(gtx layout.Context, theme *material.Theme, message chatMess
 		for _, word := range strings.Fields(part.text) {
 			word := word
 			widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
-				return layoutInlineText(gtx, theme, word+" ", message.color)
+				return layoutInlineText(gtx, theme, word+" ", theme.Fg)
 			})
 		}
 	}
@@ -1358,6 +1817,8 @@ func run(window *app.Window) error {
 		addTab.events = startAddTab(window, hc, channel)
 	}
 
+	messageInput := newMessageInputState()
+
 	savedTabs, err := hc.GetTabs()
 	if err != nil {
 		return err
@@ -1533,7 +1994,12 @@ func run(window *app.Window) error {
 			toolbar = append(toolbar, layoutTabs(gtx, theme, tabs, selectedTab, closeIcon)...)
 			toolbar = append(toolbar, addStyle.Layout)
 
-			// Draw the toolbar, chat, and users dropdown overlay.
+			selectedLogin := ""
+			if selectedTab >= 0 && selectedTab < len(tabs) {
+				selectedLogin = tabs[selectedTab].login
+			}
+
+			// Draw the toolbar, chat, message input, and overlays.
 			layout.Stack{Alignment: layout.NW}.Layout(gtx,
 				layout.Expanded(func(gtx layout.Context) layout.Dimensions {
 					return layout.Dimensions{Size: gtx.Constraints.Max}
@@ -1549,6 +2015,9 @@ func run(window *app.Window) error {
 								return layout.Dimensions{}
 							}
 							return tabs[selectedTab].chat.layout(gtx, theme)
+						}),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return layoutMessageInput(gtx, theme, messageInput, hc, window, selectedLogin)
 						}),
 					)
 				}),
