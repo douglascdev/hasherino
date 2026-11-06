@@ -24,7 +24,7 @@ type tabItem struct {
 	closeButton widget.Clickable
 }
 
-func layoutTabs(gtx layout.Context, theme *material.Theme, tabs *[]tabItem, selected *int, closeIcon *widget.Icon) layout.Dimensions {
+func layoutTabs(gtx layout.Context, theme *material.Theme, tabs *[]tabItem, selected *int, closeIcon *widget.Icon) []layout.Widget {
 	items := *tabs
 
 	// Process clicks before laying out the tabs so removed tabs disappear immediately.
@@ -42,15 +42,15 @@ func layoutTabs(gtx layout.Context, theme *material.Theme, tabs *[]tabItem, sele
 		adjustSelection(selected, closeIndex, len(items))
 	}
 
-	children := make([]layout.FlexChild, len(items))
+	widgets := make([]layout.Widget, len(items))
 	for i := range items {
 		i := i
 		tab := &items[i]
-		children[i] = layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+		widgets[i] = func(gtx layout.Context) layout.Dimensions {
 			return layoutTab(gtx, theme, tab, i == *selected, closeIcon)
-		})
+		}
 	}
-	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx, children...)
+	return widgets
 }
 
 func layoutTab(gtx layout.Context, theme *material.Theme, tab *tabItem, selected bool, closeIcon *widget.Icon) layout.Dimensions {
@@ -120,6 +120,61 @@ func adjustSelection(selected *int, closed, remaining int) {
 	case *selected == closed && *selected >= remaining:
 		*selected = remaining - 1
 	}
+}
+
+type flowItem struct {
+	call op.CallOp
+	pos  image.Point
+	size image.Point
+}
+
+// layoutFlow lays out widgets left to right, moving to the next row when the
+// available width is exceeded.
+func layoutFlow(gtx layout.Context, spaceX, spaceY unit.Dp, widgets ...layout.Widget) layout.Dimensions {
+	maxWidth := gtx.Constraints.Max.X
+	gapX := gtx.Dp(spaceX)
+	gapY := gtx.Dp(spaceY)
+
+	cgtx := gtx
+	cgtx.Constraints.Min = image.Point{}
+
+	items := make([]flowItem, 0, len(widgets))
+	x, y, rowHeight, contentWidth := 0, 0, 0, 0
+
+	for _, widget := range widgets {
+		macro := op.Record(gtx.Ops)
+		dims := widget(cgtx)
+		call := macro.Stop()
+
+		if x > 0 && x+dims.Size.X > maxWidth {
+			x = 0
+			y += rowHeight + gapY
+			rowHeight = 0
+		}
+
+		items = append(items, flowItem{
+			call: call,
+			pos:  image.Point{X: x, Y: y},
+			size: dims.Size,
+		})
+
+		if right := x + dims.Size.X; right > contentWidth {
+			contentWidth = right
+		}
+		x += dims.Size.X + gapX
+		if dims.Size.Y > rowHeight {
+			rowHeight = dims.Size.Y
+		}
+	}
+
+	for _, item := range items {
+		offset := op.Offset(item.pos).Push(gtx.Ops)
+		item.call.Add(gtx.Ops)
+		offset.Pop()
+	}
+
+	size := image.Point{X: contentWidth, Y: y + rowHeight}
+	return layout.Dimensions{Size: gtx.Constraints.Constrain(size)}
 }
 
 func main() {
@@ -218,22 +273,19 @@ func run(window *app.Window) error {
 				nextTab++
 			}
 
-			// Draw the toolbar: settings and users buttons, tabs, then the add button.
+			// Build the toolbar: settings and users buttons, tabs, then the add button.
+			toolbar := make([]layout.Widget, 0, len(tabs)+3)
+			toolbar = append(toolbar, settingsStyle.Layout, usersStyle.Layout)
+			toolbar = append(toolbar, layoutTabs(gtx, theme, &tabs, &selectedTab, closeIcon)...)
+			toolbar = append(toolbar, addStyle.Layout)
+
+			// Draw the toolbar, wrapping to the next row when it runs out of width.
 			layout.Stack{Alignment: layout.NW}.Layout(gtx,
 				layout.Expanded(func(gtx layout.Context) layout.Dimensions {
 					return layout.Dimensions{Size: gtx.Constraints.Max}
 				}),
 				layout.Stacked(func(gtx layout.Context) layout.Dimensions {
-					return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-						layout.Rigid(settingsStyle.Layout),
-						layout.Rigid(usersStyle.Layout),
-						layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
-						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							return layoutTabs(gtx, theme, &tabs, &selectedTab, closeIcon)
-						}),
-						layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
-						layout.Rigid(addStyle.Layout),
-					)
+					return layoutFlow(gtx, unit.Dp(4), unit.Dp(4), toolbar...)
 				}),
 			)
 
