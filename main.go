@@ -3,16 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/gif"
-	"image/png"
+	_ "image/png"
 	"io"
 	"log"
-	"math"
 	"os"
 	"strings"
 	"time"
@@ -32,8 +30,6 @@ import (
 	"github.com/Hashy-Software/hasherino-go/hasherino"
 	"github.com/pkg/browser"
 )
-
-const sampleWebPBase64 = "UklGRhQEAABXRUJQVlA4TAgEAAAvs0AbAA0BICEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAENH/lMsBATaC8xsAAAAAAAAAAAYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgPtrkt5dY84DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAAAAAAAAAAAECCQKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMAAAAJoAgaQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAwIUEAnBDS8JHnecmbZNMJukC4LUdcOCNV/fvUIQjIDgkQgOIvg0qgdvQUvj3iQ1Y1IGKFiGEvUUYMbS6B30Dq4Gtj8d/0MZog2gj+93MxhOUYmPYPYi4Q0ssIDvc7Y5yds/ix4L2k5wmO9Av2+EGKnOaCLF0mvyekNPsQSGL4kY8DvvXtgfr3BzFRuU02+5lPCLso+IRzw5Pqoe9zs1Z2fs+sqcTf5x0c1b2vj8LKXFBbsqsm6PdExowUjEt533gMxvxc4z3xc9IrC4dP8d4X/iMxOpVbo6Q7wbFzzHe1382PgOuHD/HeF+3mJABq7OIc8HSCc71egasziLaYkoGXDl+jvG+T4qbxdjsh0WkuBlIJ35YRIabrcgD1/G+BDeD3GYdHriO9+ncDNOx6tWQkoNkbkYYJOdmv2LVkJKDVG7mpRpSvE/kZpSnj6lna7GIsFignq3FIvqFt2pIiZYKN/NTDSksQuBmxVSdWd7HuVn9+DkmB1FuVk7VmcUiGDc7/9eEVmaERRBuJutyfrRNzM1cVUOKtgm5WUKXq14N5biZr2ro6qdtdrnMrrZ51nR+tc1W0xnWNv+XZ21T6//y8YUxMzO1NAGp/2tn4kLRNhVu5lDbFLjZ5VjbxLO1PucnYU+ETCx761SingiZWDY3Pwl6Itt4fnI/a5up/q+x+Uk0I8f7v87mJxPczNr8pM7N9u385H7WNnn/1+P8JO3/mpyfZNzM5fwk4WZbeH5yP2ubMZd5faOtvT/y90Zben/Ef9JfC3nH3mjvjfnJ/axtyv1fc2+01f6vuzfaIjd7S99oAwA="
 
 const deviceClientID = "9ofmajflpp4p2hrq81vjdyvcwlad97"
 
@@ -66,13 +62,6 @@ type chatMedia struct {
 type chat struct {
 	list     widget.List
 	messages []chatMessage
-}
-
-type chatSamples struct {
-	png    *chatMedia
-	webp   *chatMedia
-	gif    *chatMedia
-	emotes []*chatMedia
 }
 
 type userEntry struct {
@@ -267,189 +256,10 @@ func layoutFlow(gtx layout.Context, spaceX, spaceY unit.Dp, widgets ...layout.Wi
 	return layout.Dimensions{Size: gtx.Constraints.Constrain(size)}
 }
 
-func newChat(title string, samples *chatSamples) *chat {
-	colors := []color.NRGBA{
-		{R: 0x7f, G: 0xc8, B: 0xff, A: 0xff},
-		{R: 0xff, G: 0xd0, B: 0x80, A: 0xff},
-		{R: 0x90, G: 0xe0, B: 0xb0, A: 0xff},
-		{R: 0xff, G: 0x90, B: 0xc0, A: 0xff},
-	}
-	messages := []chatMessage{
-		{text: "Welcome to " + title + "!", color: colors[0]},
-		{text: "This is a scrollable chat. Use the mouse wheel or drag to scroll.", color: colors[1]},
-		{
-			color: colors[0],
-			parts: []chatPart{
-				{text: "Inline emotes work anywhere "},
-				{media: samples.emotes[0]},
-				{text: " between words "},
-				{media: samples.emotes[1]},
-				{text: " and can even be animated "},
-				{media: samples.gif},
-			},
-		},
-		{text: "A PNG image with text beside it.", color: colors[2], media: samples.png},
-		{text: "A static WebP image with text beside it.", color: colors[1], media: samples.webp},
-		{text: "An animated GIF with text beside it.", color: colors[3], media: samples.gif},
-		{text: "Images can also stand on their own:", color: colors[0]},
-		{media: samples.png},
-		{text: "A larger standalone animated GIF:", color: colors[3]},
-		{media: samples.gif},
-		{text: "Colored text can be mixed with images and animations.", color: colors[0]},
-		{text: "Every tab keeps its own scroll position.", color: colors[2]},
-	}
-	for i := 0; i < 12; i++ {
-		messages = append(messages, chatMessage{
-			text:  fmt.Sprintf("Example message %d with its own color.", i+1),
-			color: colors[i%len(colors)],
-		})
-	}
-
+func newChat() *chat {
 	var list widget.List
 	list.Axis = layout.Vertical
-	return &chat{list: list, messages: messages}
-}
-
-func newChatSamples() (*chatSamples, error) {
-	var pngData bytes.Buffer
-	if err := png.Encode(&pngData, sampleStaticImage(240, 140, 0)); err != nil {
-		return nil, err
-	}
-	pngMedia, err := decodeChatMedia(pngData.Bytes())
-	if err != nil {
-		return nil, err
-	}
-
-	webpData, err := base64.StdEncoding.DecodeString(sampleWebPBase64)
-	if err != nil {
-		return nil, err
-	}
-	webpMedia, err := decodeChatMedia(webpData)
-	if err != nil {
-		return nil, err
-	}
-
-	gifData, err := sampleGIF()
-	if err != nil {
-		return nil, err
-	}
-	gifMedia, err := decodeChatMedia(gifData)
-	if err != nil {
-		return nil, err
-	}
-
-	samples := &chatSamples{png: pngMedia, webp: webpMedia, gif: gifMedia}
-	for _, face := range []color.RGBA{
-		{R: 0xff, G: 0xc0, B: 0x50, A: 0xff},
-		{R: 0x70, G: 0xd0, B: 0xff, A: 0xff},
-	} {
-		var emoteData bytes.Buffer
-		if err := png.Encode(&emoteData, sampleEmoteImage(32, face)); err != nil {
-			return nil, err
-		}
-		media, err := decodeChatMedia(emoteData.Bytes())
-		if err != nil {
-			return nil, err
-		}
-		samples.emotes = append(samples.emotes, media)
-	}
-	return samples, nil
-}
-
-func sampleStaticImage(w, h, shift int) *image.RGBA {
-	img := image.NewRGBA(image.Rect(0, 0, w, h))
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			r := (x*255/w + shift) % 256
-			g := (y*255/h + 60) % 256
-			b := (x+y)*255/(w+h) + 80
-			if b > 255 {
-				b = 255
-			}
-			img.SetRGBA(x, y, color.RGBA{R: uint8(r), G: uint8(g), B: uint8(b), A: 255})
-		}
-	}
-	return img
-}
-
-func sampleEmoteImage(size int, face color.RGBA) *image.RGBA {
-	img := image.NewRGBA(image.Rect(0, 0, size, size))
-	cx := float64(size) / 2
-	cy := float64(size) / 2
-	setDisc(img, cx, cy, float64(size)*0.46, face)
-
-	dark := color.RGBA{R: 0x20, G: 0x20, B: 0x20, A: 0xff}
-	eyeRadius := float64(size) * 0.07
-	eyeOffsetX := float64(size) * 0.16
-	eyeOffsetY := float64(size) * 0.13
-	setDisc(img, cx-eyeOffsetX, cy-eyeOffsetY, eyeRadius, dark)
-	setDisc(img, cx+eyeOffsetX, cy-eyeOffsetY, eyeRadius, dark)
-
-	smileRadius := float64(size) * 0.25
-	for i := -3; i <= 3; i++ {
-		angle := float64(i) * 0.22
-		sx := cx + smileRadius*math.Sin(angle)
-		sy := cy + float64(size)*0.10 + smileRadius*math.Cos(angle)
-		setDisc(img, sx, sy, float64(size)*0.035, dark)
-	}
-	return img
-}
-
-func setDisc(img *image.RGBA, cx, cy, radius float64, col color.RGBA) {
-	minX := int(math.Floor(cx - radius))
-	maxX := int(math.Ceil(cx + radius))
-	minY := int(math.Floor(cy - radius))
-	maxY := int(math.Ceil(cy + radius))
-	for y := minY; y <= maxY; y++ {
-		for x := minX; x <= maxX; x++ {
-			if !image.Pt(x, y).In(img.Bounds()) {
-				continue
-			}
-			dx := float64(x) + 0.5 - cx
-			dy := float64(y) + 0.5 - cy
-			if dx*dx+dy*dy <= radius*radius {
-				img.SetRGBA(x, y, col)
-			}
-		}
-	}
-}
-
-func sampleGIF() ([]byte, error) {
-	const w, h = 200, 120
-	palette := color.Palette{
-		color.RGBA{R: 0x12, G: 0x12, B: 0x12, A: 0xff},
-		color.RGBA{R: 0x4a, G: 0x6f, B: 0xa5, A: 0xff},
-		color.RGBA{R: 0xe0, G: 0x60, B: 0x80, A: 0xff},
-		color.RGBA{R: 0x60, G: 0xd0, B: 0x90, A: 0xff},
-	}
-
-	const frameCount = 16
-	frames := make([]*image.Paletted, frameCount)
-	delays := make([]int, frameCount)
-	for i := range frames {
-		frame := image.NewPaletted(image.Rect(0, 0, w, h), palette)
-		cx := 20 + i*(w-40)/(frameCount-1)
-		cy := h / 2
-		const radius = 24
-		for y := cy - radius; y <= cy+radius; y++ {
-			for x := cx - radius; x <= cx+radius; x++ {
-				dx, dy := x-cx, y-cy
-				if dx*dx+dy*dy <= radius*radius {
-					frame.SetColorIndex(x, y, uint8(1+i%3))
-				}
-			}
-		}
-		frames[i] = frame
-		delays[i] = 8
-	}
-
-	var data bytes.Buffer
-	err := gif.EncodeAll(&data, &gif.GIF{
-		Image:     frames,
-		Delay:     delays,
-		LoopCount: 0,
-	})
-	return data.Bytes(), err
+	return &chat{list: list}
 }
 
 func decodeChatMedia(data []byte) (*chatMedia, error) {
@@ -686,12 +496,7 @@ func layoutInline(gtx layout.Context, widgets ...layout.Widget) layout.Dimension
 }
 
 func newUsersMenu() *usersMenuState {
-	menu := &usersMenuState{selected: 0}
-	for _, login := range []string{"alice", "bob", "carol", "dave", "erin"} {
-		menu.users = append(menu.users, userEntry{login: login})
-	}
-	menu.next = len(menu.users) + 1
-	return menu
+	return &usersMenuState{selected: -1, next: 1}
 }
 
 func startDeviceAuth(window *app.Window, clientID, scopes string) (<-chan deviceAuthEvent, context.CancelFunc) {
@@ -1135,14 +940,10 @@ func run(window *app.Window) error {
 		return err
 	}
 
-	samples, err := newChatSamples()
-	if err != nil {
-		return err
-	}
 	tabs := []tabItem{
-		{title: "Tab 1", chat: newChat("Tab 1", samples)},
-		{title: "Tab 2", chat: newChat("Tab 2", samples)},
-		{title: "Tab 3", chat: newChat("Tab 3", samples)},
+		{title: "Tab 1", chat: newChat()},
+		{title: "Tab 2", chat: newChat()},
+		{title: "Tab 3", chat: newChat()},
 	}
 	selectedTab := 0
 	nextTab := len(tabs) + 1
@@ -1191,7 +992,7 @@ func run(window *app.Window) error {
 			// Handle add button clicks.
 			if addButton.Clicked(gtx) {
 				title := fmt.Sprintf("Tab %d", nextTab)
-				tabs = append(tabs, tabItem{title: title, chat: newChat(title, samples)})
+				tabs = append(tabs, tabItem{title: title, chat: newChat()})
 				selectedTab = len(tabs) - 1
 				nextTab++
 			}
