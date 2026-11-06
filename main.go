@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/gif"
 	"image/png"
+	"io"
 	"log"
 	"math"
 	"os"
@@ -15,6 +18,7 @@ import (
 	"time"
 
 	"gioui.org/app"
+	"gioui.org/io/clipboard"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -24,9 +28,14 @@ import (
 	"gioui.org/widget/material"
 	"golang.org/x/exp/shiny/materialdesign/icons"
 	_ "golang.org/x/image/webp"
+
+	"github.com/Hashy-Software/hasherino-go/hasherino"
+	"github.com/pkg/browser"
 )
 
 const sampleWebPBase64 = "UklGRhQEAABXRUJQVlA4TAgEAAAvs0AbAA0BICEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAENH/lMsBATaC8xsAAAAAAAAAAAYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgPtrkt5dY84DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAAAAAAAAAAAECCQKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMAAAAJoAgaQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAwIUEAnBDS8JHnecmbZNMJukC4LUdcOCNV/fvUIQjIDgkQgOIvg0qgdvQUvj3iQ1Y1IGKFiGEvUUYMbS6B30Dq4Gtj8d/0MZog2gj+93MxhOUYmPYPYi4Q0ssIDvc7Y5yds/ix4L2k5wmO9Av2+EGKnOaCLF0mvyekNPsQSGL4kY8DvvXtgfr3BzFRuU02+5lPCLso+IRzw5Pqoe9zs1Z2fs+sqcTf5x0c1b2vj8LKXFBbsqsm6PdExowUjEt533gMxvxc4z3xc9IrC4dP8d4X/iMxOpVbo6Q7wbFzzHe1382PgOuHD/HeF+3mJABq7OIc8HSCc71egasziLaYkoGXDl+jvG+T4qbxdjsh0WkuBlIJ35YRIabrcgD1/G+BDeD3GYdHriO9+ncDNOx6tWQkoNkbkYYJOdmv2LVkJKDVG7mpRpSvE/kZpSnj6lna7GIsFignq3FIvqFt2pIiZYKN/NTDSksQuBmxVSdWd7HuVn9+DkmB1FuVk7VmcUiGDc7/9eEVmaERRBuJutyfrRNzM1cVUOKtgm5WUKXq14N5biZr2ro6qdtdrnMrrZ51nR+tc1W0xnWNv+XZ21T6//y8YUxMzO1NAGp/2tn4kLRNhVu5lDbFLjZ5VjbxLO1PucnYU+ETCx761SingiZWDY3Pwl6Itt4fnI/a5up/q+x+Uk0I8f7v87mJxPczNr8pM7N9u385H7WNnn/1+P8JO3/mpyfZNzM5fwk4WZbeH5yP2ubMZd5faOtvT/y90Zben/Ef9JfC3nH3mjvjfnJ/axtyv1fc2+01f6vuzfaIjd7S99oAwA="
+
+const deviceClientID = "9ofmajflpp4p2hrq81vjdyvcwlad97"
 
 type tabItem struct {
 	title       string
@@ -64,6 +73,45 @@ type chatSamples struct {
 	webp   *chatMedia
 	gif    *chatMedia
 	emotes []*chatMedia
+}
+
+type userEntry struct {
+	id     string
+	login  string
+	token  string
+	button widget.Clickable
+}
+
+type usersMenuState struct {
+	open     bool
+	selected int
+	next     int
+	users    []userEntry
+	add      widget.Clickable
+	remove   widget.Clickable
+	onAdd    func()
+}
+
+type deviceAuthEvent struct {
+	device *hasherino.DeviceAuthorization
+	token  *hasherino.DeviceToken
+	id     string
+	login  string
+	err    error
+}
+
+type deviceAuthState struct {
+	open            bool
+	pending         bool
+	userCode        string
+	verificationURI string
+	errText         string
+	events          <-chan deviceAuthEvent
+	cancel          context.CancelFunc
+	backdrop        widget.Clickable
+	openButton      widget.Clickable
+	copyButton      widget.Clickable
+	closeButton     widget.Clickable
 }
 
 func layoutTabs(gtx layout.Context, theme *material.Theme, tabs *[]tabItem, selected *int, closeIcon *widget.Icon) []layout.Widget {
@@ -637,6 +685,390 @@ func layoutInline(gtx layout.Context, widgets ...layout.Widget) layout.Dimension
 	return layout.Dimensions{Size: gtx.Constraints.Constrain(image.Point{X: contentWidth, Y: y})}
 }
 
+func newUsersMenu() *usersMenuState {
+	menu := &usersMenuState{selected: 0}
+	for _, login := range []string{"alice", "bob", "carol", "dave", "erin"} {
+		menu.users = append(menu.users, userEntry{login: login})
+	}
+	menu.next = len(menu.users) + 1
+	return menu
+}
+
+func startDeviceAuth(window *app.Window, clientID, scopes string) (<-chan deviceAuthEvent, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	events := make(chan deviceAuthEvent, 4)
+
+	go func() {
+		defer close(events)
+		defer cancel()
+
+		emit := func(event deviceAuthEvent) {
+			select {
+			case events <- event:
+			case <-ctx.Done():
+				return
+			}
+			window.Invalidate()
+		}
+
+		oauth := hasherino.NewTwitchOAuth()
+		device, err := oauth.StartDeviceAuth(ctx, clientID, scopes)
+		if err != nil {
+			emit(deviceAuthEvent{err: err})
+			return
+		}
+		emit(deviceAuthEvent{device: device})
+
+		interval := time.Duration(device.Interval) * time.Second
+		if interval <= 0 {
+			interval = 5 * time.Second
+		}
+		token, err := oauth.WaitForDeviceAuth(ctx, clientID, scopes, device.DeviceCode, interval)
+		if err != nil {
+			emit(deviceAuthEvent{err: err})
+			return
+		}
+
+		id, login, err := oauth.GetUserForToken(clientID, token.AccessToken)
+		if err != nil {
+			emit(deviceAuthEvent{err: err})
+			return
+		}
+		emit(deviceAuthEvent{token: token, id: id, login: login})
+	}()
+
+	return events, cancel
+}
+
+func (a *deviceAuthState) drain(menu *usersMenuState) {
+	for a.events != nil {
+		select {
+		case event, ok := <-a.events:
+			if !ok {
+				a.events = nil
+				return
+			}
+			a.apply(event, menu)
+		default:
+			return
+		}
+	}
+}
+
+func (a *deviceAuthState) apply(event deviceAuthEvent, menu *usersMenuState) {
+	switch {
+	case event.err != nil:
+		if errors.Is(event.err, context.Canceled) {
+			a.close()
+			return
+		}
+		a.pending = false
+		a.errText = friendlyDeviceAuthError(event.err)
+	case event.device != nil:
+		a.pending = true
+		a.userCode = event.device.UserCode
+		a.verificationURI = event.device.VerificationURI
+	case event.token != nil:
+		a.pending = false
+		if event.login != "" {
+			selectOrAddUser(menu, event.id, event.login, event.token.AccessToken)
+			menu.open = false
+		}
+		a.close()
+	}
+}
+
+func (a *deviceAuthState) close() {
+	if a.cancel != nil {
+		a.cancel()
+		a.cancel = nil
+	}
+	a.events = nil
+	a.open = false
+	a.pending = false
+	a.userCode = ""
+	a.verificationURI = ""
+	a.errText = ""
+}
+
+func selectOrAddUser(menu *usersMenuState, id, login, token string) {
+	for i := range menu.users {
+		if menu.users[i].login == login {
+			menu.users[i].id = id
+			menu.users[i].token = token
+			menu.selected = i
+			return
+		}
+	}
+	menu.users = append(menu.users, userEntry{id: id, login: login, token: token})
+	menu.selected = len(menu.users) - 1
+}
+
+func friendlyDeviceAuthError(err error) string {
+	switch {
+	case errors.Is(err, hasherino.ErrDeviceAccessDenied):
+		return "Twitch authorization was denied."
+	case errors.Is(err, hasherino.ErrDeviceCodeExpired):
+		return "The Twitch code expired. Please try again."
+	case errors.Is(err, hasherino.ErrDeviceSlowDown):
+		return "Twitch asked us to slow down. Please try again."
+	default:
+		return err.Error()
+	}
+}
+
+func layoutUsersMenu(gtx layout.Context, theme *material.Theme, state *usersMenuState, addIcon, deleteIcon *widget.Icon) layout.Dimensions {
+	for i := range state.users {
+		if state.users[i].button.Clicked(gtx) {
+			state.selected = i
+		}
+	}
+
+	if state.add.Clicked(gtx) {
+		if state.onAdd != nil {
+			state.onAdd()
+		} else {
+			state.users = append(state.users, userEntry{login: fmt.Sprintf("user%d", state.next)})
+			state.selected = len(state.users) - 1
+			state.next++
+		}
+	}
+	if state.remove.Clicked(gtx) && state.selected >= 0 && state.selected < len(state.users) {
+		state.users = append(state.users[:state.selected], state.users[state.selected+1:]...)
+		switch {
+		case len(state.users) == 0:
+			state.selected = -1
+		case state.selected >= len(state.users):
+			state.selected = len(state.users) - 1
+		}
+	}
+
+	width := gtx.Dp(unit.Dp(220))
+	if width > gtx.Constraints.Max.X {
+		width = gtx.Constraints.Max.X
+	}
+	gtx.Constraints.Min.X = width
+	gtx.Constraints.Max.X = width
+
+	background := func(gtx layout.Context) layout.Dimensions {
+		size := gtx.Constraints.Min
+		radius := gtx.Dp(unit.Dp(8))
+		panel := color.NRGBA{R: 0x1e, G: 0x1e, B: 0x24, A: 0xff}
+		paint.FillShape(gtx.Ops, panel, clip.UniformRRect(image.Rectangle{Max: size}, radius).Op(gtx.Ops))
+		return layout.Dimensions{Size: size}
+	}
+
+	content := func(gtx layout.Context) layout.Dimensions {
+		return layout.Inset{
+			Top:    unit.Dp(8),
+			Bottom: unit.Dp(8),
+			Left:   unit.Dp(8),
+			Right:  unit.Dp(8),
+		}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			children := make([]layout.FlexChild, 0, len(state.users)+3)
+			for i := range state.users {
+				i := i
+				entry := &state.users[i]
+				children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layoutUserRow(gtx, theme, entry, i == state.selected)
+				}))
+			}
+			children = append(children,
+				layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return layoutMenuIconButton(gtx, theme, &state.add, addIcon, "Add user")
+						}),
+						layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return layoutMenuIconButton(gtx, theme, &state.remove, deleteIcon, "Remove user")
+						}),
+					)
+				}),
+			)
+			return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+		})
+	}
+
+	return layout.Background{}.Layout(gtx, background, content)
+}
+
+func layoutUserRow(gtx layout.Context, theme *material.Theme, entry *userEntry, selected bool) layout.Dimensions {
+	return entry.button.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		row := func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{
+				Top:    unit.Dp(6),
+				Bottom: unit.Dp(6),
+				Left:   unit.Dp(8),
+				Right:  unit.Dp(8),
+			}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				label := material.Body1(theme, entry.login)
+				label.Color = theme.Fg
+				if !selected {
+					label.Color.A = 0x99
+				}
+				return label.Layout(gtx)
+			})
+		}
+		if !selected {
+			return row(gtx)
+		}
+
+		highlight := func(gtx layout.Context) layout.Dimensions {
+			size := gtx.Constraints.Min
+			fill := theme.ContrastBg
+			fill.A = 0x66
+			radius := gtx.Dp(unit.Dp(4))
+			paint.FillShape(gtx.Ops, fill, clip.UniformRRect(image.Rectangle{Max: size}, radius).Op(gtx.Ops))
+			return layout.Dimensions{Size: size}
+		}
+		return layout.Background{}.Layout(gtx, highlight, row)
+	})
+}
+
+func layoutMenuIconButton(gtx layout.Context, theme *material.Theme, button *widget.Clickable, icon *widget.Icon, description string) layout.Dimensions {
+	style := material.IconButton(theme, button, icon, description)
+	style.Background = color.NRGBA{}
+	style.Color = theme.Fg
+	style.Size = 18
+	style.Inset = layout.UniformInset(6)
+	return style.Layout(gtx)
+}
+
+func layoutDeviceAuth(gtx layout.Context, theme *material.Theme, state *deviceAuthState) layout.Dimensions {
+	// Consume clicks on the backdrop so they cannot reach the UI underneath.
+	state.backdrop.Clicked(gtx)
+
+	if state.closeButton.Clicked(gtx) {
+		state.close()
+		return layout.Dimensions{}
+	}
+	if state.openButton.Clicked(gtx) && state.verificationURI != "" {
+		browser.OpenURL(state.verificationURI)
+	}
+	if state.copyButton.Clicked(gtx) && state.userCode != "" {
+		gtx.Execute(clipboard.WriteCmd{
+			Type: "text/plain",
+			Data: io.NopCloser(strings.NewReader(state.userCode)),
+		})
+	}
+	if !state.open {
+		return layout.Dimensions{}
+	}
+
+	return layout.Stack{Alignment: layout.Center}.Layout(gtx,
+		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+			return state.backdrop.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				paint.Fill(gtx.Ops, color.NRGBA{A: 0xb0})
+				return layout.Dimensions{Size: gtx.Constraints.Max}
+			})
+		}),
+		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+			return layoutDeviceAuthPanel(gtx, theme, state)
+		}),
+	)
+}
+
+func layoutDeviceAuthPanel(gtx layout.Context, theme *material.Theme, state *deviceAuthState) layout.Dimensions {
+	width := gtx.Dp(unit.Dp(360))
+	if width > gtx.Constraints.Max.X {
+		width = gtx.Constraints.Max.X
+	}
+	gtx.Constraints.Min.X = width
+	gtx.Constraints.Max.X = width
+	gtx.Constraints.Min.Y = 0
+
+	background := func(gtx layout.Context) layout.Dimensions {
+		size := gtx.Constraints.Min
+		radius := gtx.Dp(unit.Dp(10))
+		panel := color.NRGBA{R: 0x1e, G: 0x1e, B: 0x24, A: 0xff}
+		paint.FillShape(gtx.Ops, panel, clip.UniformRRect(image.Rectangle{Max: size}, radius).Op(gtx.Ops))
+		return layout.Dimensions{Size: size}
+	}
+
+	content := func(gtx layout.Context) layout.Dimensions {
+		return layout.Inset{
+			Top:    unit.Dp(20),
+			Bottom: unit.Dp(20),
+			Left:   unit.Dp(20),
+			Right:  unit.Dp(20),
+		}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			children := []layout.FlexChild{
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return material.H6(theme, "Add Twitch account").Layout(gtx)
+				}),
+				layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
+			}
+
+			switch {
+			case state.errText != "":
+				children = append(children,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						label := material.Body1(theme, state.errText)
+						label.Color = color.NRGBA{R: 0xff, G: 0x90, B: 0x90, A: 0xff}
+						return label.Layout(gtx)
+					}),
+					layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.E.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							return material.Button(theme, &state.closeButton, "Close").Layout(gtx)
+						})
+					}),
+				)
+			case state.userCode == "":
+				children = append(children,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return material.Body1(theme, "Requesting a code from Twitch...").Layout(gtx)
+					}),
+				)
+			default:
+				children = append(children,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return material.Body1(theme, "Open twitch.tv/activate and enter this code:").Layout(gtx)
+					}),
+					layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						code := material.H3(theme, state.userCode)
+						code.Color = theme.ContrastBg
+						return code.Layout(gtx)
+					}),
+					layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return material.Button(theme, &state.openButton, "Open Twitch").Layout(gtx)
+							}),
+							layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return material.Button(theme, &state.copyButton, "Copy code").Layout(gtx)
+							}),
+						)
+					}),
+					layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						status := "Waiting for authorization..."
+						if !state.pending {
+							status = "Finishing sign-in..."
+						}
+						return material.Body2(theme, status).Layout(gtx)
+					}),
+					layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.E.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							return material.Button(theme, &state.closeButton, "Cancel").Layout(gtx)
+						})
+					}),
+				)
+			}
+
+			return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+		})
+	}
+
+	return layout.Background{}.Layout(gtx, background, content)
+}
+
 func main() {
 	go func() {
 		window := new(app.Window)
@@ -681,6 +1113,28 @@ func run(window *app.Window) error {
 	usersStyle.Size = 20
 	usersStyle.Inset = layout.UniformInset(8)
 
+	usersMenu := newUsersMenu()
+	deviceAuth := &deviceAuthState{}
+	usersMenu.onAdd = func() {
+		if deviceAuth.open {
+			return
+		}
+		deviceAuth.open = true
+		deviceAuth.pending = true
+		deviceAuth.userCode = ""
+		deviceAuth.verificationURI = ""
+		deviceAuth.errText = ""
+		deviceAuth.events, deviceAuth.cancel = startDeviceAuth(window, deviceClientID, hasherino.TwitchOAuthScopes)
+	}
+	userAddIcon, err := widget.NewIcon(icons.SocialPersonAdd)
+	if err != nil {
+		return err
+	}
+	userDeleteIcon, err := widget.NewIcon(icons.ActionDelete)
+	if err != nil {
+		return err
+	}
+
 	samples, err := newChatSamples()
 	if err != nil {
 		return err
@@ -712,10 +1166,14 @@ func run(window *app.Window) error {
 	for {
 		switch e := window.Event().(type) {
 		case app.DestroyEvent:
+			deviceAuth.close()
 			return e.Err
 		case app.FrameEvent:
 			// This graphics context is used for managing the rendering state.
 			gtx := app.NewContext(&ops, e)
+
+			// Apply device authorization updates from the background poller.
+			deviceAuth.drain(usersMenu)
 
 			// Paint the window background using the theme's background color.
 			paint.Fill(gtx.Ops, theme.Bg)
@@ -725,9 +1183,9 @@ func run(window *app.Window) error {
 				log.Println("settings clicked")
 			}
 
-			// Handle user button clicks.
+			// Toggle the users dropdown.
 			if usersButton.Clicked(gtx) {
-				log.Println("users clicked")
+				usersMenu.open = !usersMenu.open
 			}
 
 			// Handle add button clicks.
@@ -744,17 +1202,38 @@ func run(window *app.Window) error {
 			toolbar = append(toolbar, layoutTabs(gtx, theme, &tabs, &selectedTab, closeIcon)...)
 			toolbar = append(toolbar, addStyle.Layout)
 
-			// Draw the toolbar and the selected tab's chat below it.
-			layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return layoutFlow(gtx, unit.Dp(4), unit.Dp(4), toolbar...)
+			// Draw the toolbar, chat, and users dropdown overlay.
+			layout.Stack{Alignment: layout.NW}.Layout(gtx,
+				layout.Expanded(func(gtx layout.Context) layout.Dimensions {
+					return layout.Dimensions{Size: gtx.Constraints.Max}
 				}),
-				layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
-				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-					if selectedTab < 0 || selectedTab >= len(tabs) || tabs[selectedTab].chat == nil {
+				layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+					return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return layoutFlow(gtx, unit.Dp(4), unit.Dp(4), toolbar...)
+						}),
+						layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
+						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+							if selectedTab < 0 || selectedTab >= len(tabs) || tabs[selectedTab].chat == nil {
+								return layout.Dimensions{}
+							}
+							return tabs[selectedTab].chat.layout(gtx, theme)
+						}),
+					)
+				}),
+				layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+					if !usersMenu.open {
 						return layout.Dimensions{}
 					}
-					return tabs[selectedTab].chat.layout(gtx, theme)
+					return layout.Inset{Top: unit.Dp(44), Left: unit.Dp(40)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return layoutUsersMenu(gtx, theme, usersMenu, userAddIcon, userDeleteIcon)
+					})
+				}),
+				layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+					if !deviceAuth.open {
+						return layout.Dimensions{}
+					}
+					return layoutDeviceAuth(gtx, theme, deviceAuth)
 				}),
 			)
 

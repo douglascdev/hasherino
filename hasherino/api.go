@@ -2,6 +2,7 @@ package hasherino
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pkg/browser"
@@ -149,6 +151,188 @@ func (t *TwitchOAuth) ListenForOAuthRedirect(hc *HasherinoController) {
 	}
 }
 
+// Device Code Grant support.
+//
+// The implicit grant flow above is kept for clients that still use it. Device
+// Code Grant is meant for public clients that cannot keep a client secret or
+// receive a redirect, such as mobile apps.
+const (
+	TwitchOAuthScopes   = "chat:edit chat:read user:manage:chat_color user:read:emotes"
+	deviceCodeGrantType = "urn:ietf:params:oauth:grant-type:device_code"
+)
+
+var (
+	ErrDeviceAuthorizationPending = errors.New("authorization_pending")
+	ErrDeviceSlowDown             = errors.New("slow_down")
+	ErrDeviceAccessDenied         = errors.New("access_denied")
+	ErrDeviceCodeExpired          = errors.New("expired_token")
+)
+
+// DeviceAuthorization is the response from Twitch's device authorization
+// endpoint. The user enters UserCode at VerificationURI while the client polls
+// for a token with DeviceCode.
+type DeviceAuthorization struct {
+	DeviceCode      string `json:"device_code"`
+	ExpiresIn       int    `json:"expires_in"`
+	Interval        int    `json:"interval"`
+	UserCode        string `json:"user_code"`
+	VerificationURI string `json:"verification_uri"`
+}
+
+// DeviceToken is the access/refresh token pair returned by the device flow.
+type DeviceToken struct {
+	AccessToken  string   `json:"access_token"`
+	ExpiresIn    int      `json:"expires_in"`
+	RefreshToken string   `json:"refresh_token"`
+	Scope        []string `json:"scope"`
+	TokenType    string   `json:"token_type"`
+}
+
+type twitchOAuthError struct {
+	Status    int    `json:"status"`
+	Message   string `json:"message"`
+	ErrorCode string `json:"error"`
+}
+
+func (e *twitchOAuthError) Error() string {
+	message := e.Message
+	if message == "" {
+		message = e.ErrorCode
+	}
+	if message == "" {
+		message = "unknown error"
+	}
+	if e.Status != 0 {
+		return fmt.Sprintf("twitch oauth: %s (status %d)", message, e.Status)
+	}
+	return "twitch oauth: " + message
+}
+
+// StartDeviceAuth asks Twitch for a device and user code. Show the returned
+// UserCode and VerificationURI to the user, then poll with WaitForDeviceAuth.
+func (t *TwitchOAuth) StartDeviceAuth(ctx context.Context, clientID, scopes string) (*DeviceAuthorization, error) {
+	form := url.Values{}
+	form.Set("client_id", clientID)
+	form.Set("scopes", scopes)
+
+	var authorization DeviceAuthorization
+	if err := t.postOAuthForm(ctx, "https://id.twitch.tv/oauth2/device", form, &authorization); err != nil {
+		return nil, err
+	}
+	if authorization.DeviceCode == "" || authorization.UserCode == "" {
+		return nil, errors.New("twitch oauth: device authorization response is missing a code")
+	}
+	return &authorization, nil
+}
+
+// CheckDeviceAuth performs one token poll. It returns
+// ErrDeviceAuthorizationPending while the user has not approved the request.
+func (t *TwitchOAuth) CheckDeviceAuth(ctx context.Context, clientID, scopes, deviceCode string) (*DeviceToken, error) {
+	form := url.Values{}
+	form.Set("client_id", clientID)
+	form.Set("scopes", scopes)
+	form.Set("device_code", deviceCode)
+	form.Set("grant_type", deviceCodeGrantType)
+
+	var token DeviceToken
+	if err := t.postOAuthForm(ctx, "https://id.twitch.tv/oauth2/token", form, &token); err != nil {
+		return nil, err
+	}
+	return &token, nil
+}
+
+// WaitForDeviceAuth polls until the user approves the request, the code
+// expires, or ctx is cancelled.
+func (t *TwitchOAuth) WaitForDeviceAuth(ctx context.Context, clientID, scopes, deviceCode string, interval time.Duration) (*DeviceToken, error) {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+			token, err := t.CheckDeviceAuth(ctx, clientID, scopes, deviceCode)
+			switch {
+			case err == nil:
+				return token, nil
+			case errors.Is(err, ErrDeviceAuthorizationPending):
+			case errors.Is(err, ErrDeviceSlowDown):
+				interval += 5 * time.Second
+			default:
+				return nil, err
+			}
+			timer.Reset(interval)
+		}
+	}
+}
+
+// RefreshDeviceToken exchanges a device-flow refresh token for a new access
+// token. Public clients do not send a client secret. The returned refresh
+// token is normally rotated, so callers must persist it.
+func (t *TwitchOAuth) RefreshDeviceToken(ctx context.Context, clientID, refreshToken string) (*DeviceToken, error) {
+	form := url.Values{}
+	form.Set("client_id", clientID)
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refreshToken)
+
+	var token DeviceToken
+	if err := t.postOAuthForm(ctx, "https://id.twitch.tv/oauth2/token", form, &token); err != nil {
+		return nil, err
+	}
+	return &token, nil
+}
+
+func (t *TwitchOAuth) postOAuthForm(ctx context.Context, endpoint string, form url.Values, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		var oauthErr twitchOAuthError
+		_ = json.Unmarshal(body, &oauthErr)
+		if oauthErr.Status == 0 {
+			oauthErr.Status = resp.StatusCode
+		}
+		switch oauthErr.Message {
+		case ErrDeviceAuthorizationPending.Error():
+			return ErrDeviceAuthorizationPending
+		case ErrDeviceSlowDown.Error():
+			return ErrDeviceSlowDown
+		case ErrDeviceAccessDenied.Error():
+			return ErrDeviceAccessDenied
+		case ErrDeviceCodeExpired.Error():
+			return ErrDeviceCodeExpired
+		}
+		if oauthErr.Message == "" && oauthErr.ErrorCode == "" {
+			oauthErr.Message = resp.Status
+		}
+		return &oauthErr
+	}
+
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("twitch oauth: decode response: %w", err)
+	}
+	return nil
+}
+
 type Helix struct {
 	appId string
 }
@@ -217,6 +401,18 @@ func (h *Helix) GetUsers(token string, usernames []string) (*HelixUsers, error) 
 	}
 
 	return &users, nil
+}
+
+// GetUserForToken returns the id and login of the account that owns token.
+func (t *TwitchOAuth) GetUserForToken(clientID, token string) (id, login string, err error) {
+	users, err := NewHelix(clientID).GetUsers(token, nil)
+	if err != nil {
+		return "", "", err
+	}
+	if len(users.Data) != 1 {
+		return "", "", errors.New("twitch oauth: could not determine user for token")
+	}
+	return users.Data[0].ID, users.Data[0].Login, nil
 }
 
 type ChatMessagesJson struct {
