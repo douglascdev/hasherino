@@ -7,6 +7,7 @@ require (
 	fyne.io/x/fyne v0.0.0-20261007154834-b636b6d322fc
 	gioui.org v0.10.3
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
+	golang.org/x/exp/shiny v0.0.0-20250408133849-7e4ce0ab07d0
 	golang.org/x/image v0.47.0
 	gopkg.in/irc.v4 v4.0.0
 	gorm.io/driver/sqlite v1.6.0
@@ -47,7 +48,6 @@ require (
 	github.com/stretchr/testify v1.12.1 // indirect
 	github.com/yuin/goldmark v1.8.6 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/exp/shiny v0.0.0-20250408133849-7e4ce0ab07d0 // indirect
 	golang.org/x/net v0.61.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
