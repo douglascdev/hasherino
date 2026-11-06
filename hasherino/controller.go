@@ -3,6 +3,7 @@ package hasherino
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
@@ -34,7 +35,16 @@ type HasherinoController struct {
 	userEmotesLoadedId string
 }
 
+const defaultClientID = "hvmj7blkwy2gw3xf820n47i85g4sub"
+
 func (hc *HasherinoController) New(callbackMap map[string]func(ChatMessage)) (*HasherinoController, error) {
+	return hc.NewWithClientID(callbackMap, defaultClientID)
+}
+
+// NewWithClientID creates a controller that uses clientID for Helix requests.
+// Tokens only work with the client ID that created them, so the client that
+// minted the token must be passed here.
+func (hc *HasherinoController) NewWithClientID(callbackMap map[string]func(ChatMessage), clientID string) (*HasherinoController, error) {
 	writeWS := &TwitchChatWebsocket{}
 	readWS := &TwitchChatWebsocket{}
 
@@ -63,7 +73,7 @@ func (hc *HasherinoController) New(callbackMap map[string]func(ChatMessage)) (*H
 	permDB.AutoMigrate(&Account{}, &Tab{}, &AppSettings{})
 
 	c := &HasherinoController{
-		appId:       "hvmj7blkwy2gw3xf820n47i85g4sub",
+		appId:       clientID,
 		callbackMap: callbackMap,
 		twitchOAuth: NewTwitchOAuth(),
 		readWS:      readWS,
@@ -270,7 +280,7 @@ func (hc *HasherinoController) AddTab(channel string) error {
 		helix := NewHelix(hc.appId)
 		users, err := helix.GetUsers(activeAccount.Token, []string{channel})
 		if err != nil || len(users.Data) != 1 {
-			return errors.New("failed to obtain channel's id and login")
+			return fmt.Errorf("failed to obtain channel's id and login: %w", err)
 		}
 
 		login := strings.ToLower(users.Data[0].Login)

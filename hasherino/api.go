@@ -394,6 +394,10 @@ func (h *Helix) GetUsers(token string, usernames []string) (*HelixUsers, error) 
 		return nil, err
 	}
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("helix users request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
 	var users HelixUsers
 	if err := json.Unmarshal(body, &users); err != nil {
 		log.Printf("Failed to unmarshal response body: %s", err)

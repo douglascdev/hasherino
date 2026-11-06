@@ -12,12 +12,15 @@ import (
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"gioui.org/app"
 	"gioui.org/io/clipboard"
+	"gioui.org/io/key"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -35,6 +38,8 @@ import (
 const deviceClientID = "9ofmajflpp4p2hrq81vjdyvcwlad97"
 
 type tabItem struct {
+	id          string
+	login       string
 	title       string
 	button      widget.Clickable
 	closeButton widget.Clickable
@@ -62,7 +67,27 @@ type chatMedia struct {
 
 type chat struct {
 	list     widget.List
+	mu       sync.Mutex
 	messages []chatMessage
+}
+
+const maxChatMessages = 500
+
+func (c *chat) append(message chatMessage) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.messages = append(c.messages, message)
+	if len(c.messages) > maxChatMessages {
+		c.messages = c.messages[len(c.messages)-maxChatMessages:]
+	}
+}
+
+func (c *chat) snapshot() []chatMessage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	messages := make([]chatMessage, len(c.messages))
+	copy(messages, c.messages)
+	return messages
 }
 
 type userEntry struct {
@@ -107,30 +132,88 @@ type deviceAuthState struct {
 	closeButton     widget.Clickable
 }
 
-func layoutTabs(gtx layout.Context, theme *material.Theme, tabs *[]tabItem, selected *int, closeIcon *widget.Icon) []layout.Widget {
-	items := *tabs
+type addTabEvent struct {
+	tab *hasherino.Tab
+	err error
+}
 
-	// Process clicks before laying out the tabs so removed tabs disappear immediately.
-	closeIndex := -1
-	for i := range items {
-		if items[i].closeButton.Clicked(gtx) {
-			closeIndex = i
-		} else if items[i].button.Clicked(gtx) {
-			*selected = i
+type addTabState struct {
+	open         bool
+	pending      bool
+	errText      string
+	editor       widget.Editor
+	events       <-chan addTabEvent
+	backdrop     widget.Clickable
+	addButton    widget.Clickable
+	cancelButton widget.Clickable
+}
+
+func (a *addTabState) drain(handle func(addTabEvent)) {
+	for a.events != nil {
+		select {
+		case event, ok := <-a.events:
+			if !ok {
+				a.events = nil
+				return
+			}
+			handle(event)
+		default:
+			return
 		}
 	}
-	if closeIndex >= 0 {
-		items = append(items[:closeIndex], items[closeIndex+1:]...)
-		*tabs = items
-		adjustSelection(selected, closeIndex, len(items))
-	}
+}
 
-	widgets := make([]layout.Widget, len(items))
-	for i := range items {
+func (a *addTabState) close() {
+	a.events = nil
+	a.open = false
+	a.pending = false
+	a.errText = ""
+	a.editor.SetText("")
+}
+
+func startAddTab(window *app.Window, hc *hasherino.HasherinoController, channel string) <-chan addTabEvent {
+	events := make(chan addTabEvent, 1)
+
+	go func() {
+		defer close(events)
+
+		emit := func(event addTabEvent) {
+			select {
+			case events <- event:
+			default:
+			}
+			window.Invalidate()
+		}
+
+		if err := hc.AddTab(channel); err != nil {
+			emit(addTabEvent{err: err})
+			return
+		}
+
+		tabs, err := hc.GetTabs()
+		if err != nil {
+			emit(addTabEvent{err: err})
+			return
+		}
+		for _, tab := range tabs {
+			if strings.EqualFold(tab.Login, channel) {
+				emit(addTabEvent{tab: tab})
+				return
+			}
+		}
+		emit(addTabEvent{err: errors.New("tab not found after adding")})
+	}()
+
+	return events
+}
+
+func layoutTabs(gtx layout.Context, theme *material.Theme, tabs []tabItem, selected int, closeIcon *widget.Icon) []layout.Widget {
+	widgets := make([]layout.Widget, len(tabs))
+	for i := range tabs {
 		i := i
-		tab := &items[i]
+		tab := &tabs[i]
 		widgets[i] = func(gtx layout.Context) layout.Dimensions {
-			return layoutTab(gtx, theme, tab, i == *selected, closeIcon)
+			return layoutTab(gtx, theme, tab, i == selected, closeIcon)
 		}
 	}
 	return widgets
@@ -202,6 +285,54 @@ func adjustSelection(selected *int, closed, remaining int) {
 		*selected--
 	case *selected == closed && *selected >= remaining:
 		*selected = remaining - 1
+	}
+}
+
+func newTabItem(tab *hasherino.Tab) tabItem {
+	title := tab.DisplayName
+	if title == "" {
+		title = tab.Login
+	}
+	return tabItem{
+		id:    tab.Id,
+		login: tab.Login,
+		title: title,
+		chat:  newChat(),
+	}
+}
+
+func registerTabCallback(window *app.Window, callbackMap map[string]func(hasherino.ChatMessage), tab *tabItem) {
+	chat := tab.chat
+	callbackMap[tab.login] = func(message hasherino.ChatMessage) {
+		if message.Command != "PRIVMSG" {
+			return
+		}
+		chat.append(chatMessage{
+			text:  message.Author + ": " + message.Text,
+			color: parseHexColor(message.AuthorColor),
+		})
+		window.Invalidate()
+	}
+}
+
+func parseHexColor(value string) color.NRGBA {
+	defaultColor := color.NRGBA{R: 0xe6, G: 0xe6, B: 0xe6, A: 0xff}
+	value = strings.TrimPrefix(value, "#")
+	if len(value) == 3 {
+		value = string([]byte{value[0], value[0], value[1], value[1], value[2], value[2]})
+	}
+	if len(value) != 6 {
+		return defaultColor
+	}
+	parsed, err := strconv.ParseUint(value, 16, 32)
+	if err != nil {
+		return defaultColor
+	}
+	return color.NRGBA{
+		R: uint8(parsed >> 16),
+		G: uint8(parsed >> 8),
+		B: uint8(parsed),
+		A: 0xff,
 	}
 }
 
@@ -325,6 +456,7 @@ func (m *chatMedia) frame(now time.Time) (paint.ImageOp, time.Time) {
 
 func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensions {
 	now := time.Now()
+	messages := c.snapshot()
 	c.list.Gap = gtx.Dp(unit.Dp(8))
 	return layout.Inset{
 		Top:    unit.Dp(8),
@@ -332,8 +464,8 @@ func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensio
 		Left:   unit.Dp(12),
 		Right:  unit.Dp(12),
 	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return material.List(theme, &c.list).Layout(gtx, len(c.messages), func(gtx layout.Context, index int) layout.Dimensions {
-			return layoutChatMessage(gtx, theme, c.messages[index], now)
+		return material.List(theme, &c.list).Layout(gtx, len(messages), func(gtx layout.Context, index int) layout.Dimensions {
+			return layoutChatMessage(gtx, theme, messages[index], now)
 		})
 	})
 }
@@ -819,26 +951,35 @@ func layoutDeviceAuth(gtx layout.Context, theme *material.Theme, state *deviceAu
 		return layout.Dimensions{}
 	}
 
+	return layoutModal(gtx, &state.backdrop, func(gtx layout.Context) layout.Dimensions {
+		return layoutModalPanel(gtx, unit.Dp(360), func(gtx layout.Context) layout.Dimensions {
+			return layoutDeviceAuthContent(gtx, theme, state)
+		})
+	})
+}
+
+// layoutModal draws a centered dialog on top of a backdrop that swallows
+// pointer events, so the UI underneath cannot be interacted with.
+func layoutModal(gtx layout.Context, backdrop *widget.Clickable, panel layout.Widget) layout.Dimensions {
 	return layout.Stack{Alignment: layout.Center}.Layout(gtx,
 		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
-			return state.backdrop.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return backdrop.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 				paint.Fill(gtx.Ops, color.NRGBA{A: 0xb0})
 				return layout.Dimensions{Size: gtx.Constraints.Max}
 			})
 		}),
-		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
-			return layoutDeviceAuthPanel(gtx, theme, state)
-		}),
+		layout.Stacked(panel),
 	)
 }
 
-func layoutDeviceAuthPanel(gtx layout.Context, theme *material.Theme, state *deviceAuthState) layout.Dimensions {
-	width := gtx.Dp(unit.Dp(360))
-	if width > gtx.Constraints.Max.X {
-		width = gtx.Constraints.Max.X
+// layoutModalPanel wraps content in the dialog's rounded background.
+func layoutModalPanel(gtx layout.Context, width unit.Dp, content layout.Widget) layout.Dimensions {
+	panelWidth := gtx.Dp(width)
+	if panelWidth > gtx.Constraints.Max.X {
+		panelWidth = gtx.Constraints.Max.X
 	}
-	gtx.Constraints.Min.X = width
-	gtx.Constraints.Max.X = width
+	gtx.Constraints.Min.X = panelWidth
+	gtx.Constraints.Max.X = panelWidth
 	gtx.Constraints.Min.Y = 0
 
 	background := func(gtx layout.Context) layout.Dimensions {
@@ -849,86 +990,151 @@ func layoutDeviceAuthPanel(gtx layout.Context, theme *material.Theme, state *dev
 		return layout.Dimensions{Size: size}
 	}
 
-	content := func(gtx layout.Context) layout.Dimensions {
+	wrapped := func(gtx layout.Context) layout.Dimensions {
 		return layout.Inset{
 			Top:    unit.Dp(20),
 			Bottom: unit.Dp(20),
 			Left:   unit.Dp(20),
 			Right:  unit.Dp(20),
-		}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			children := []layout.FlexChild{
-				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return material.H6(theme, "Add Twitch account").Layout(gtx)
-				}),
-				layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
-			}
+		}.Layout(gtx, content)
+	}
+	return layout.Background{}.Layout(gtx, background, wrapped)
+}
 
-			switch {
-			case state.errText != "":
-				children = append(children,
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						label := material.Body1(theme, state.errText)
-						label.Color = color.NRGBA{R: 0xff, G: 0x90, B: 0x90, A: 0xff}
-						return label.Layout(gtx)
-					}),
-					layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return layout.E.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-							return material.Button(theme, &state.closeButton, "Close").Layout(gtx)
-						})
-					}),
-				)
-			case state.userCode == "":
-				children = append(children,
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return material.Body1(theme, "Requesting a code from Twitch...").Layout(gtx)
-					}),
-				)
-			default:
-				children = append(children,
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return material.Body1(theme, "Open twitch.tv/activate and enter this code:").Layout(gtx)
-					}),
-					layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						code := material.H3(theme, state.userCode)
-						code.Color = theme.ContrastBg
-						return code.Layout(gtx)
-					}),
-					layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-								return material.Button(theme, &state.openButton, "Open Twitch").Layout(gtx)
-							}),
-							layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
-							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-								return material.Button(theme, &state.copyButton, "Copy code").Layout(gtx)
-							}),
-						)
-					}),
-					layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						status := "Waiting for authorization..."
-						if !state.pending {
-							status = "Finishing sign-in..."
-						}
-						return material.Body2(theme, status).Layout(gtx)
-					}),
-					layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return layout.E.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-							return material.Button(theme, &state.closeButton, "Cancel").Layout(gtx)
-						})
-					}),
-				)
-			}
+func layoutAddTab(gtx layout.Context, theme *material.Theme, state *addTabState) layout.Dimensions {
+	state.backdrop.Clicked(gtx)
 
-			return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
-		})
+	if state.cancelButton.Clicked(gtx) {
+		state.close()
+		return layout.Dimensions{}
+	}
+	if !state.open {
+		return layout.Dimensions{}
 	}
 
-	return layout.Background{}.Layout(gtx, background, content)
+	return layoutModal(gtx, &state.backdrop, func(gtx layout.Context) layout.Dimensions {
+		return layoutModalPanel(gtx, unit.Dp(360), func(gtx layout.Context) layout.Dimensions {
+			return layoutAddTabContent(gtx, theme, state)
+		})
+	})
+}
+
+func layoutAddTabContent(gtx layout.Context, theme *material.Theme, state *addTabState) layout.Dimensions {
+	children := []layout.FlexChild{
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return material.H6(theme, "Add tab").Layout(gtx)
+		}),
+		layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			editor := material.Editor(theme, &state.editor, "Channel")
+			editor.TextSize = unit.Sp(16)
+			return editor.Layout(gtx)
+		}),
+		layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+	}
+
+	if state.errText != "" {
+		children = append(children,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				label := material.Body1(theme, state.errText)
+				label.Color = color.NRGBA{R: 0xff, G: 0x90, B: 0x90, A: 0xff}
+				return label.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+		)
+	}
+
+	children = append(children,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			label := "Add"
+			if state.pending {
+				label = "Adding..."
+			}
+			return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return material.Button(theme, &state.addButton, label).Layout(gtx)
+				}),
+				layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return material.Button(theme, &state.cancelButton, "Cancel").Layout(gtx)
+				}),
+			)
+		}),
+	)
+
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+}
+
+func layoutDeviceAuthContent(gtx layout.Context, theme *material.Theme, state *deviceAuthState) layout.Dimensions {
+	children := []layout.FlexChild{
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return material.H6(theme, "Add Twitch account").Layout(gtx)
+		}),
+		layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
+	}
+
+	switch {
+	case state.errText != "":
+		children = append(children,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				label := material.Body1(theme, state.errText)
+				label.Color = color.NRGBA{R: 0xff, G: 0x90, B: 0x90, A: 0xff}
+				return label.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.E.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return material.Button(theme, &state.closeButton, "Close").Layout(gtx)
+				})
+			}),
+		)
+	case state.userCode == "":
+		children = append(children,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return material.Body1(theme, "Requesting a code from Twitch...").Layout(gtx)
+			}),
+		)
+	default:
+		children = append(children,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return material.Body1(theme, "Open twitch.tv/activate and enter this code:").Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				code := material.H3(theme, state.userCode)
+				code.Color = theme.ContrastBg
+				return code.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return material.Button(theme, &state.openButton, "Open Twitch").Layout(gtx)
+					}),
+					layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return material.Button(theme, &state.copyButton, "Copy code").Layout(gtx)
+					}),
+				)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				status := "Waiting for authorization..."
+				if !state.pending {
+					status = "Finishing sign-in..."
+				}
+				return material.Body2(theme, status).Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.E.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return material.Button(theme, &state.closeButton, "Cancel").Layout(gtx)
+				})
+			}),
+		)
+	}
+
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
 }
 
 func main() {
@@ -955,7 +1161,7 @@ func run(window *app.Window) error {
 
 	callbackMap := make(map[string]func(hasherino.ChatMessage))
 	hc := &hasherino.HasherinoController{}
-	hc, err := hc.New(callbackMap)
+	hc, err := hc.NewWithClientID(callbackMap, deviceClientID)
 	if err != nil {
 		return err
 	}
@@ -999,14 +1205,20 @@ func run(window *app.Window) error {
 			}
 		}()
 	}
-	if len(usersMenu.users) > 0 {
-		startListening()
-	}
 
 	deviceAuth := &deviceAuthState{}
 	deviceAuth.onAccount = func(id, login, token string) error {
+		hadActiveAccount := false
+		if _, err := hc.GetActiveAccount(); err == nil {
+			hadActiveAccount = true
+		}
 		if err := hc.UpsertAccount(id, login, token); err != nil {
 			return err
+		}
+		if !hadActiveAccount {
+			// The new account became the active one, so the chat connection
+			// has to be established with its token.
+			listening.Store(false)
 		}
 		startListening()
 		return nil
@@ -1044,6 +1256,61 @@ func run(window *app.Window) error {
 			listening.Store(false)
 		}
 	}
+
+	addTab := &addTabState{}
+	addTab.editor.SingleLine = true
+	addTab.editor.Submit = true
+	submitAddTab := func(channel string) {
+		channel = strings.ToLower(strings.TrimSpace(channel))
+		if channel == "" {
+			addTab.errText = "Enter a channel name."
+			return
+		}
+		if addTab.pending {
+			return
+		}
+		addTab.pending = true
+		addTab.errText = ""
+		addTab.events = startAddTab(window, hc, channel)
+	}
+
+	savedTabs, err := hc.GetTabs()
+	if err != nil {
+		return err
+	}
+	tabs := make([]tabItem, 0, len(savedTabs))
+	tabIds := make([]string, 0, len(savedTabs))
+	selectedTab := -1
+	selectedLogin := ""
+	if selected, err := hc.GetSelectedTab(); err == nil {
+		selectedLogin = selected.Login
+	} else {
+		log.Printf("failed to load selected tab: %s", err)
+	}
+	for _, saved := range savedTabs {
+		item := newTabItem(saved)
+		registerTabCallback(window, callbackMap, &item)
+		tabs = append(tabs, item)
+		tabIds = append(tabIds, saved.Id)
+		if selectedLogin != "" && strings.EqualFold(saved.Login, selectedLogin) {
+			selectedTab = len(tabs) - 1
+		}
+	}
+	if len(tabs) > 0 {
+		if selectedTab < 0 {
+			selectedTab = 0
+		}
+		if err := hc.SetSelectedTab(tabs[selectedTab].login); err != nil {
+			log.Printf("failed to save selected tab: %s", err)
+		}
+		if err := hc.AddTempTabs(&tabIds); err != nil {
+			log.Printf("failed to load tab emotes: %s", err)
+		}
+	}
+	if len(usersMenu.users) > 0 {
+		startListening()
+	}
+
 	userAddIcon, err := widget.NewIcon(icons.SocialPersonAdd)
 	if err != nil {
 		return err
@@ -1052,14 +1319,6 @@ func run(window *app.Window) error {
 	if err != nil {
 		return err
 	}
-
-	tabs := []tabItem{
-		{title: "Tab 1", chat: newChat()},
-		{title: "Tab 2", chat: newChat()},
-		{title: "Tab 3", chat: newChat()},
-	}
-	selectedTab := 0
-	nextTab := len(tabs) + 1
 
 	closeIcon, err := widget.NewIcon(icons.NavigationClose)
 	if err != nil {
@@ -1081,6 +1340,7 @@ func run(window *app.Window) error {
 		switch e := window.Event().(type) {
 		case app.DestroyEvent:
 			deviceAuth.close()
+			addTab.close()
 			return e.Err
 		case app.FrameEvent:
 			// This graphics context is used for managing the rendering state.
@@ -1089,31 +1349,102 @@ func run(window *app.Window) error {
 			// Apply device authorization updates from the background poller.
 			deviceAuth.drain(usersMenu)
 
+			// Apply add-tab updates from the background controller call.
+			addTab.drain(func(event addTabEvent) {
+				switch {
+				case event.err != nil:
+					addTab.pending = false
+					addTab.errText = event.err.Error()
+				case event.tab != nil:
+					addTab.pending = false
+					item := newTabItem(event.tab)
+					registerTabCallback(window, callbackMap, &item)
+					tabs = append(tabs, item)
+					selectedTab = len(tabs) - 1
+					if err := hc.SetSelectedTab(item.login); err != nil {
+						log.Printf("failed to save selected tab: %s", err)
+					}
+					addTab.close()
+				default:
+					addTab.pending = false
+					addTab.errText = "Unexpected add-tab result."
+				}
+			})
+
 			// Paint the window background using the theme's background color.
 			paint.Fill(gtx.Ops, theme.Bg)
 
-			// Handle settings button clicks.
-			if settingsButton.Clicked(gtx) {
-				log.Println("settings clicked")
+			// While a modal dialog is open, the UI underneath must not react.
+			if !deviceAuth.open && !addTab.open {
+				if settingsButton.Clicked(gtx) {
+					log.Println("settings clicked")
+				}
+
+				// Toggle the users dropdown.
+				if usersButton.Clicked(gtx) {
+					usersMenu.open = !usersMenu.open
+				}
+
+				// Open the add-tab dialog.
+				if addButton.Clicked(gtx) {
+					addTab.open = true
+					addTab.pending = false
+					addTab.errText = ""
+					addTab.editor.SetText("")
+					gtx.Execute(key.FocusCmd{Tag: &addTab.editor})
+				}
+
+				// Process tab clicks before layout so the UI updates immediately.
+				closeIndex := -1
+				for i := range tabs {
+					if tabs[i].closeButton.Clicked(gtx) {
+						closeIndex = i
+						break
+					}
+					if tabs[i].button.Clicked(gtx) {
+						selectedTab = i
+						if err := hc.SetSelectedTab(tabs[i].login); err != nil {
+							log.Printf("failed to save selected tab: %s", err)
+						}
+					}
+				}
+				if closeIndex >= 0 {
+					closed := tabs[closeIndex]
+					if err := hc.RemoveTab(closed.id); err != nil {
+						log.Printf("failed to remove tab %s: %s", closed.login, err)
+					} else {
+						delete(callbackMap, closed.login)
+						tabs = append(tabs[:closeIndex], tabs[closeIndex+1:]...)
+						adjustSelection(&selectedTab, closeIndex, len(tabs))
+						if selectedTab >= 0 && selectedTab < len(tabs) {
+							if err := hc.SetSelectedTab(tabs[selectedTab].login); err != nil {
+								log.Printf("failed to save selected tab: %s", err)
+							}
+						}
+					}
+				}
 			}
 
-			// Toggle the users dropdown.
-			if usersButton.Clicked(gtx) {
-				usersMenu.open = !usersMenu.open
-			}
-
-			// Handle add button clicks.
-			if addButton.Clicked(gtx) {
-				title := fmt.Sprintf("Tab %d", nextTab)
-				tabs = append(tabs, tabItem{title: title, chat: newChat()})
-				selectedTab = len(tabs) - 1
-				nextTab++
+			// Handle the add-tab dialog's own buttons and submit events.
+			if addTab.open {
+				if addTab.addButton.Clicked(gtx) && !addTab.pending {
+					submitAddTab(addTab.editor.Text())
+				}
+				for {
+					event, ok := addTab.editor.Update(gtx)
+					if !ok {
+						break
+					}
+					if submit, ok := event.(widget.SubmitEvent); ok {
+						submitAddTab(submit.Text)
+					}
+				}
 			}
 
 			// Build the toolbar: settings and users buttons, tabs, then the add button.
 			toolbar := make([]layout.Widget, 0, len(tabs)+3)
 			toolbar = append(toolbar, settingsStyle.Layout, usersStyle.Layout)
-			toolbar = append(toolbar, layoutTabs(gtx, theme, &tabs, &selectedTab, closeIcon)...)
+			toolbar = append(toolbar, layoutTabs(gtx, theme, tabs, selectedTab, closeIcon)...)
 			toolbar = append(toolbar, addStyle.Layout)
 
 			// Draw the toolbar, chat, and users dropdown overlay.
@@ -1148,6 +1479,12 @@ func run(window *app.Window) error {
 						return layout.Dimensions{}
 					}
 					return layoutDeviceAuth(gtx, theme, deviceAuth)
+				}),
+				layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+					if !addTab.open {
+						return layout.Dimensions{}
+					}
+					return layoutAddTab(gtx, theme, addTab)
 				}),
 			)
 
