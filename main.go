@@ -1384,7 +1384,12 @@ func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensio
 	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return material.List(theme, &c.list).Layout(gtx, len(messages), func(gtx layout.Context, index int) layout.Dimensions {
 			c.requestEmotes(messages[index])
-			return layoutChatMessage(gtx, theme, messages[index], &animator)
+			dims := layoutChatMessage(gtx, theme, messages[index], &animator)
+			// Report the full available width even for short messages.
+			// Otherwise the list sizes itself to the widest visible message,
+			// and its scrollbar shifts horizontally as messages scroll by.
+			dims.Size.X = gtx.Constraints.Max.X
+			return dims
 		})
 	})
 	animator.invalidate(gtx)
