@@ -407,6 +407,86 @@ func (h *Helix) GetUsers(token string, usernames []string) (*HelixUsers, error) 
 	return &users, nil
 }
 
+// HelixChatBadges is a set of chat badges from the helix chat badges
+// endpoints.
+type HelixChatBadges struct {
+	Data []struct {
+		SetID    string `json:"set_id"`
+		Versions []struct {
+			ID          string `json:"id"`
+			ImageURL1x  string `json:"image_url_1x"`
+			ImageURL2x  string `json:"image_url_2x"`
+			ImageURL4x  string `json:"image_url_4x"`
+			Title       string `json:"title"`
+			Description string `json:"description"`
+		} `json:"versions"`
+	} `json:"data"`
+}
+
+// GetChatBadges returns the badge image URLs keyed by badge set and version.
+// A blank broadcasterID requests the global badge sets, otherwise the channel's
+// badge sets are requested.
+func (h *Helix) GetChatBadges(token string, broadcasterID string) (map[string]map[string]string, error) {
+	requestURL := "https://api.twitch.tv/helix/chat/badges/global"
+	if broadcasterID != "" {
+		requestURL = "https://api.twitch.tv/helix/chat/badges?broadcaster_id=" + url.QueryEscape(broadcasterID)
+	}
+
+	req, err := http.NewRequest("GET", requestURL, nil)
+	if err != nil {
+		log.Printf("Failed to create request for helix chat badges: %s", err)
+		return nil, err
+	}
+	req.Header.Add("Authorization", "Bearer "+token)
+	req.Header.Add("Client-Id", h.appId)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("Failed to get helix chat badges: %s", err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Failed to read helix chat badges response body: %s", err)
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("helix chat badges request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var badges HelixChatBadges
+	if err := json.Unmarshal(body, &badges); err != nil {
+		log.Printf("Failed to unmarshal helix chat badges response body: %s", err)
+		return nil, err
+	}
+
+	sets := make(map[string]map[string]string, len(badges.Data))
+	for _, set := range badges.Data {
+		if set.SetID == "" || len(set.Versions) == 0 {
+			continue
+		}
+		versions := make(map[string]string, len(set.Versions))
+		for _, version := range set.Versions {
+			imageURL := version.ImageURL2x
+			if imageURL == "" {
+				imageURL = version.ImageURL1x
+			}
+			if imageURL == "" {
+				imageURL = version.ImageURL4x
+			}
+			if version.ID != "" && imageURL != "" {
+				versions[version.ID] = imageURL
+			}
+		}
+		if len(versions) > 0 {
+			sets[set.SetID] = versions
+		}
+	}
+	return sets, nil
+}
+
 // GetUserForToken returns the id and login of the account that owns token.
 func (t *TwitchOAuth) GetUserForToken(clientID, token string) (id, login string, err error) {
 	users, err := NewHelix(clientID).GetUsers(token, nil)

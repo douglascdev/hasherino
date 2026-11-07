@@ -9,6 +9,11 @@ import (
 	"gopkg.in/irc.v4"
 )
 
+type Badge struct {
+	Name    string // badge set name from the irc badges tag, like "moderator"
+	Version string // version within the set, like "1"
+}
+
 type ChatMessage struct {
 	Channel     string
 	Command     string
@@ -17,6 +22,7 @@ type ChatMessage struct {
 	Text        string
 	Time        time.Time
 	Emotes      map[string]*Emote // twitch emotes of the message from the irc emotes tag, keyed by name
+	Badges      []Badge           // badges of the author from the irc badges tag, in display order
 }
 
 func ParseMessage(message string) (*ChatMessage, error) {
@@ -50,8 +56,28 @@ func ParseMessage(message string) (*ChatMessage, error) {
 		Text:        paramsText,
 		Time:        sentAt,
 		Emotes:      parseTagEmotes(msg.Tags["emotes"], paramsText),
+		Badges:      parseTagBadges(msg.Tags["badges"]),
 	}, nil
 
+}
+
+// parseTagBadges parses the badges tag of a privmsg, e.g.
+// "moderator/1,subscriber/12", into the badges the author wears, in the
+// order twitch lists them. Entries without both a name and a version are
+// skipped.
+func parseTagBadges(tag string) []Badge {
+	if tag == "" {
+		return nil
+	}
+	var badges []Badge
+	for _, entry := range strings.Split(tag, ",") {
+		name, version, found := strings.Cut(entry, "/")
+		if !found || name == "" || version == "" {
+			continue
+		}
+		badges = append(badges, Badge{Name: name, Version: version})
+	}
+	return badges
 }
 
 // parseTagEmotes parses the emotes tag of a privmsg, e.g.

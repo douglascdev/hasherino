@@ -50,6 +50,58 @@ func TestParseMessageExtractsTheAuthorColor(t *testing.T) {
 	}
 }
 
+func TestParseMessageExtractsTagBadges(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		badges  []Badge
+	}{
+		{
+			name:    "missing badges tag",
+			message: `@tmi-sent-ts=1700000000000 :user!user@user.tmi.twitch.tv PRIVMSG #channel :hello`,
+			badges:  nil,
+		},
+		{
+			name:    "empty badges tag",
+			message: `@badges=;tmi-sent-ts=1700000000000 :user!user@user.tmi.twitch.tv PRIVMSG #channel :hello`,
+			badges:  nil,
+		},
+		{
+			name:    "multiple badges keep display order",
+			message: `@badges=broadcaster/1,subscriber/12,premium/1;tmi-sent-ts=1700000000000 :user!user@user.tmi.twitch.tv PRIVMSG #channel :hello`,
+			badges: []Badge{
+				{Name: "broadcaster", Version: "1"},
+				{Name: "subscriber", Version: "12"},
+				{Name: "premium", Version: "1"},
+			},
+		},
+		{
+			name:    "malformed entries are skipped",
+			message: `@badges=moderator,vip/,/1,partner/1;tmi-sent-ts=1700000000000 :user!user@user.tmi.twitch.tv PRIVMSG #channel :hello`,
+			badges: []Badge{
+				{Name: "partner", Version: "1"},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			msg, err := ParseMessage(test.message)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(msg.Badges) != len(test.badges) {
+				t.Fatalf("expected %d badges, got %d: %v", len(test.badges), len(msg.Badges), msg.Badges)
+			}
+			for i, want := range test.badges {
+				if msg.Badges[i] != want {
+					t.Errorf("badge %d: expected %+v, got %+v", i, want, msg.Badges[i])
+				}
+			}
+		})
+	}
+}
+
 func TestParseMessageExtractsTagEmotes(t *testing.T) {
 	tests := []struct {
 		name    string

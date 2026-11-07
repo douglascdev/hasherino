@@ -542,6 +542,43 @@ func (hc *HasherinoController) GetChannelEmotes(channel string) ([]*Emote, error
 	return emotes, nil
 }
 
+// GetChatBadges returns the badge image URLs available in the given channel,
+// keyed by badge set and version. Global badges are merged with the channel's
+// own badges, which take precedence for sets present in both.
+func (hc *HasherinoController) GetChatBadges(channelID string) (map[string]map[string]string, error) {
+	activeAccount, err := hc.GetActiveAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	helix := NewHelix(hc.appId)
+	badges, err := helix.GetChatBadges(activeAccount.Token, "")
+	if err != nil {
+		return nil, err
+	}
+	if channelID == "" {
+		return badges, nil
+	}
+
+	channelBadges, err := helix.GetChatBadges(activeAccount.Token, channelID)
+	if err != nil {
+		// Global badges are still useful when the channel's cannot be loaded.
+		log.Printf("failed to load channel badges for %s: %s", channelID, err)
+		return badges, nil
+	}
+	for setID, versions := range channelBadges {
+		merged := badges[setID]
+		if merged == nil {
+			merged = make(map[string]string, len(versions))
+			badges[setID] = merged
+		}
+		for version, imageURL := range versions {
+			merged[version] = imageURL
+		}
+	}
+	return badges, nil
+}
+
 func (hc *HasherinoController) RemoveTab(id string) error {
 	err := hc.permDB.Transaction(func(tx *gorm.DB) error {
 		tab := &Tab{}

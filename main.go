@@ -65,6 +65,10 @@ type chatMessage struct {
 	// ownEmotes are the emotes the message itself carries from its irc tags,
 	// keyed by name. They win over the emotes of the channel.
 	ownEmotes map[string]*hasherino.Emote
+	// rawBadges are the badges the message carries from its irc tags. The
+	// image urls are resolved from the channel's badge sets into badgeURLs.
+	rawBadges []hasherino.Badge
+	badgeURLs []string
 }
 
 type chatMedia struct {
@@ -85,6 +89,9 @@ type chat struct {
 	// emotes are the emotes that can be rendered in the channel, keyed by
 	// name. They are replaced when the channel emotes finish loading.
 	emotes map[string]*hasherino.Emote
+	// badges are the badge image urls of the channel, keyed by badge set and
+	// version. They are replaced when the channel badges finish loading.
+	badges map[string]map[string]string
 	// window is used to repaint the chat when an emote finishes loading.
 	window *app.Window
 }
@@ -138,10 +145,42 @@ func (c *chat) append(message chatMessage) {
 		c.limit = defaultChatMessageLimit
 	}
 	message.parts = c.buildPartsLocked(message.text, message.ownEmotes)
+	message.badgeURLs = c.resolveBadgesLocked(message.rawBadges)
 	c.messages = append(c.messages, message)
 	if len(c.messages) > c.limit {
 		c.messages = c.messages[len(c.messages)-c.limit:]
 	}
+}
+
+// setBadges replaces the badge sets that can be rendered in the channel and
+// resolves the badges of the messages that were already appended.
+func (c *chat) setBadges(badges map[string]map[string]string) {
+	c.mu.Lock()
+	c.badges = badges
+	for i := range c.messages {
+		message := &c.messages[i]
+		message.badgeURLs = c.resolveBadgesLocked(message.rawBadges)
+	}
+	c.mu.Unlock()
+}
+
+// resolveBadgesLocked returns the image urls of the badges in display order.
+// Badges without a known image are skipped.
+func (c *chat) resolveBadgesLocked(badges []hasherino.Badge) []string {
+	if len(badges) == 0 || len(c.badges) == 0 {
+		return nil
+	}
+	urls := make([]string, 0, len(badges))
+	for _, badge := range badges {
+		versions := c.badges[badge.Name]
+		if versions == nil {
+			continue
+		}
+		if url := versions[badge.Version]; url != "" {
+			urls = append(urls, url)
+		}
+	}
+	return urls
 }
 
 // setEmotes replaces the emotes that can be rendered in the channel and
@@ -215,6 +254,18 @@ func (c *chat) requestEmotes(message chatMessage) {
 		if part.emote != nil {
 			loadChatEmote(c.window, part.emote)
 		}
+	}
+}
+
+// requestBadges starts loading the badge images of a message. It is called
+// while the message is laid out, so only the badges of messages in view are
+// loaded.
+func (c *chat) requestBadges(message chatMessage) {
+	if c.window == nil {
+		return
+	}
+	for _, url := range message.badgeURLs {
+		loadChatBadge(c.window, url)
 	}
 }
 
@@ -650,6 +701,7 @@ func registerTabCallback(window *app.Window, callbackMap map[string]func(hasheri
 			authorColor: parseHexColor(message.AuthorColor),
 			text:        message.Text,
 			ownEmotes:   message.Emotes,
+			rawBadges:   message.Badges,
 		})
 		window.Invalidate()
 	}
@@ -696,6 +748,7 @@ func loadChatHistory(window *app.Window, hc *hasherino.HasherinoController, tab 
 				authorColor: parseHexColor(message.AuthorColor),
 				text:        message.Text,
 				ownEmotes:   message.Emotes,
+				rawBadges:   message.Badges,
 			})
 		}
 		chat.requestScrollToEnd()
@@ -735,6 +788,20 @@ func loadChannelEmotes(window *app.Window, hc *hasherino.HasherinoController, ta
 			tab.chat.setEmotes(emotes)
 			window.Invalidate()
 		}
+	}()
+}
+
+// loadChannelBadges fetches the badge sets of the channel in the background
+// and gives them to the tab's chat, which renders them next to author names.
+func loadChannelBadges(window *app.Window, hc *hasherino.HasherinoController, tab *tabItem) {
+	go func() {
+		badges, err := hc.GetChatBadges(tab.id)
+		if err != nil {
+			log.Printf("failed to load badges for %s: %s", tab.login, err)
+			return
+		}
+		tab.chat.setBadges(badges)
+		window.Invalidate()
 	}()
 }
 
@@ -1204,6 +1271,106 @@ func loadChatEmote(window *app.Window, emote *hasherino.Emote) {
 	}()
 }
 
+var chatBadgeMedia = &chatBadgeMediaCache{
+	entries: make(map[string]*chatBadgeMediaEntry),
+}
+
+type chatBadgeMediaEntry struct {
+	media   *chatMedia
+	loading bool
+	failed  bool
+}
+
+// chatBadgeMediaCache keeps the decoded badge images in memory, shared by
+// every message and tab showing the same badge.
+type chatBadgeMediaCache struct {
+	mu      sync.Mutex
+	entries map[string]*chatBadgeMediaEntry
+}
+
+func cachedChatBadgeMedia(url string) *chatMedia {
+	if url == "" {
+		return nil
+	}
+	chatBadgeMedia.mu.Lock()
+	defer chatBadgeMedia.mu.Unlock()
+	if entry, ok := chatBadgeMedia.entries[url]; ok {
+		return entry.media
+	}
+	return nil
+}
+
+// requestChatBadgeMedia returns the media of the badge when it is already
+// loaded and reports whether the caller should start loading it.
+func requestChatBadgeMedia(url string) (media *chatMedia, load bool) {
+	chatBadgeMedia.mu.Lock()
+	defer chatBadgeMedia.mu.Unlock()
+	entry, ok := chatBadgeMedia.entries[url]
+	if !ok {
+		entry = &chatBadgeMediaEntry{}
+		chatBadgeMedia.entries[url] = entry
+	}
+	if entry.media != nil {
+		return entry.media, false
+	}
+	if entry.loading || entry.failed {
+		return nil, false
+	}
+	entry.loading = true
+	return nil, true
+}
+
+func finishChatBadgeMedia(url string, media *chatMedia) {
+	chatBadgeMedia.mu.Lock()
+	defer chatBadgeMedia.mu.Unlock()
+	entry, ok := chatBadgeMedia.entries[url]
+	if !ok {
+		entry = &chatBadgeMediaEntry{}
+		chatBadgeMedia.entries[url] = entry
+	}
+	entry.loading = false
+	entry.media = media
+	entry.failed = media == nil
+}
+
+// loadChatBadge starts downloading and decoding a badge image unless it is
+// already loaded or loading. The window is invalidated once it is ready.
+func loadChatBadge(window *app.Window, url string) {
+	if url == "" {
+		return
+	}
+	_, load := requestChatBadgeMedia(url)
+	if !load {
+		return
+	}
+	go func() {
+		media, err := downloadChatBadge(url)
+		if err != nil {
+			log.Printf("Failed to load badge %s: %s", url, err)
+			finishChatBadgeMedia(url, nil)
+			return
+		}
+		finishChatBadgeMedia(url, media)
+		window.Invalidate()
+	}()
+}
+
+func downloadChatBadge(url string) (*chatMedia, error) {
+	resp, err := chatEmoteClient.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("downloading badge %s failed: %s", url, resp.Status)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return decodeChatMedia(data)
+}
+
 func downloadChatEmote(emote *hasherino.Emote) (*chatMedia, error) {
 	url, err := emote.GetUrl()
 	if err != nil {
@@ -1403,6 +1570,7 @@ func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensio
 	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return material.List(theme, &c.list).Layout(gtx, len(messages), func(gtx layout.Context, index int) layout.Dimensions {
 			c.requestEmotes(messages[index])
+			c.requestBadges(messages[index])
 			dims := layoutChatMessage(gtx, theme, messages[index], &animator)
 			// Report the full available width even for short messages.
 			// Otherwise the list sizes itself to the widest visible message,
@@ -1479,6 +1647,16 @@ func layoutChatMedia(gtx layout.Context, media *chatMedia, animator *chatAnimato
 
 func layoutChatParts(gtx layout.Context, theme *material.Theme, message chatMessage, animator *chatAnimator) layout.Dimensions {
 	widgets := make([]layout.Widget, 0, len(message.parts)+1)
+	for _, url := range message.badgeURLs {
+		media := cachedChatBadgeMedia(url)
+		if media == nil {
+			continue
+		}
+		widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
+			return layoutChatBadge(gtx, media)
+		})
+		widgets = append(widgets, layoutInlineSpacer(unit.Dp(2)))
+	}
 	if message.author != "" {
 		author := message.author + ": "
 		authorColor := message.authorColor
@@ -1535,6 +1713,20 @@ func layoutInlineSpacer(width unit.Dp) layout.Widget {
 	return func(gtx layout.Context) layout.Dimensions {
 		return layout.Dimensions{Size: image.Point{X: gtx.Dp(width)}}
 	}
+}
+
+func layoutChatBadge(gtx layout.Context, media *chatMedia) layout.Dimensions {
+	if media == nil || len(media.frames) == 0 {
+		return layout.Dimensions{}
+	}
+	height := gtx.Dp(unit.Dp(18))
+	width := height
+	if media.width > 0 && media.height > 0 {
+		width = height * media.width / media.height
+	}
+	gtx.Constraints.Min = image.Point{}
+	gtx.Constraints.Max = image.Point{X: width, Y: height}
+	return widget.Image{Src: media.frames[0], Fit: widget.Contain, Position: layout.Center}.Layout(gtx)
 }
 
 func layoutInlineEmote(gtx layout.Context, media *chatMedia, animator *chatAnimator) layout.Dimensions {
@@ -2280,6 +2472,7 @@ func run(window *app.Window) error {
 		registerTabCallback(window, callbackMap, &item)
 		loadChatHistory(window, hc, &item)
 		loadChannelEmotes(window, hc, &item)
+		loadChannelBadges(window, hc, &item)
 		tabs = append(tabs, item)
 		tabIds = append(tabIds, saved.Id)
 		if selectedLogin != "" && strings.EqualFold(saved.Login, selectedLogin) {
@@ -2351,6 +2544,7 @@ func run(window *app.Window) error {
 					registerTabCallback(window, callbackMap, &item)
 					loadChatHistory(window, hc, &item)
 					loadChannelEmotes(window, hc, &item)
+					loadChannelBadges(window, hc, &item)
 					tabs = append(tabs, item)
 					selectedTab = len(tabs) - 1
 					if err := hc.SetSelectedTab(item.login); err != nil {
