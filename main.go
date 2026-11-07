@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/gif"
 	_ "image/png"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -50,6 +52,7 @@ type tabItem struct {
 
 type chatPart struct {
 	text  string
+	emote *hasherino.Emote
 	media *chatMedia
 }
 
@@ -59,6 +62,9 @@ type chatMessage struct {
 	text        string
 	media       *chatMedia
 	parts       []chatPart
+	// ownEmotes are the emotes the message itself carries from its irc tags,
+	// keyed by name. They win over the emotes of the channel.
+	ownEmotes map[string]*hasherino.Emote
 }
 
 type chatMedia struct {
@@ -66,6 +72,8 @@ type chatMedia struct {
 	delays []time.Duration
 	total  time.Duration
 	start  time.Time
+	width  int
+	height int
 }
 
 type chat struct {
@@ -74,9 +82,23 @@ type chat struct {
 	messages    []chatMessage
 	limit       int
 	scrollToEnd bool
+	// emotes are the emotes that can be rendered in the channel, keyed by
+	// name. They are replaced when the channel emotes finish loading.
+	emotes map[string]*hasherino.Emote
+	// window is used to repaint the chat when an emote finishes loading.
+	window *app.Window
 }
 
-const defaultChatMessageLimit = 500
+const (
+	defaultChatMessageLimit = 500
+
+	// The emotes of a channel are loaded in the background after its tab is
+	// created. The first checks are fast so freshly loaded emotes are picked
+	// up quickly, later checks back off to not hammer the database.
+	channelEmotePollFirstInterval = 100 * time.Millisecond
+	channelEmotePollMaxInterval   = 2 * time.Second
+	channelEmotePollAttempts      = 40
+)
 
 func (c *chat) setLimit(limit int) {
 	if limit <= 0 {
@@ -115,9 +137,84 @@ func (c *chat) append(message chatMessage) {
 	if c.limit <= 0 {
 		c.limit = defaultChatMessageLimit
 	}
+	message.parts = c.buildPartsLocked(message.text, message.ownEmotes)
 	c.messages = append(c.messages, message)
 	if len(c.messages) > c.limit {
 		c.messages = c.messages[len(c.messages)-c.limit:]
+	}
+}
+
+// setEmotes replaces the emotes that can be rendered in the channel and
+// rebuilds the messages whose text may now render as emotes.
+func (c *chat) setEmotes(emotes []*hasherino.Emote) {
+	byName := make(map[string]*hasherino.Emote, len(emotes))
+	for _, emote := range emotes {
+		if emote != nil && emote.Name != "" {
+			byName[emote.Name] = emote
+		}
+	}
+
+	c.mu.Lock()
+	c.emotes = byName
+	for i := range c.messages {
+		message := &c.messages[i]
+		message.parts = c.buildPartsLocked(message.text, message.ownEmotes)
+	}
+	c.mu.Unlock()
+}
+
+// buildPartsLocked splits the text of a message into text and emote parts.
+// The emotes of the message win over the emotes of the channel, because the
+// irc tags mark exactly what twitch rendered as an emote.
+func (c *chat) buildPartsLocked(text string, ownEmotes map[string]*hasherino.Emote) []chatPart {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return nil
+	}
+
+	parts := make([]chatPart, 0, len(words))
+	var textPart strings.Builder
+	flushText := func() {
+		if textPart.Len() == 0 {
+			return
+		}
+		parts = append(parts, chatPart{text: textPart.String()})
+		textPart.Reset()
+	}
+
+	for _, word := range words {
+		emote := ownEmotes[word]
+		if emote == nil {
+			emote = c.emotes[word]
+		}
+		if emote == nil {
+			if textPart.Len() > 0 {
+				textPart.WriteByte(' ')
+			}
+			textPart.WriteString(word)
+			continue
+		}
+
+		flushText()
+		parts = append(parts, chatPart{
+			emote: emote,
+			media: cachedChatEmoteMedia(emote),
+		})
+	}
+	flushText()
+	return parts
+}
+
+// requestEmotes starts loading the emotes of a message. It is called while
+// the message is laid out, so only the emotes of messages in view are loaded.
+func (c *chat) requestEmotes(message chatMessage) {
+	if c.window == nil {
+		return
+	}
+	for _, part := range message.parts {
+		if part.emote != nil {
+			loadChatEmote(c.window, part.emote)
+		}
 	}
 }
 
@@ -529,6 +626,7 @@ func newTabItem(tab *hasherino.Tab) tabItem {
 
 func registerTabCallback(window *app.Window, callbackMap map[string]func(hasherino.ChatMessage), tab *tabItem) {
 	chat := tab.chat
+	chat.window = window
 	callbackMap[tab.login] = func(message hasherino.ChatMessage) {
 		if message.Command != "PRIVMSG" {
 			return
@@ -537,6 +635,7 @@ func registerTabCallback(window *app.Window, callbackMap map[string]func(hasheri
 			author:      message.Author,
 			authorColor: parseHexColor(message.AuthorColor),
 			text:        message.Text,
+			ownEmotes:   message.Emotes,
 		})
 		window.Invalidate()
 	}
@@ -579,11 +678,59 @@ func loadChatHistory(window *app.Window, hc *hasherino.HasherinoController, tab 
 				author:      message.Author,
 				authorColor: parseHexColor(message.AuthorColor),
 				text:        message.Text,
+				ownEmotes:   message.Emotes,
 			})
 		}
 		chat.requestScrollToEnd()
 		window.Invalidate()
 	}()
+}
+
+// loadChannelEmotes waits for the emotes of the channel to become available
+// and gives them to the tab's chat, which renders the matching message words
+// as emotes.
+func loadChannelEmotes(window *app.Window, hc *hasherino.HasherinoController, tab *tabItem) {
+	go func() {
+		// The emotes of the channel are loaded in the background, usually in
+		// several steps: the account's twitch emotes and the channel's 7tv
+		// emotes finish at different times. Keep polling until the set stops
+		// changing so none of them are missed.
+		last := ""
+		interval := channelEmotePollFirstInterval
+		for range channelEmotePollAttempts {
+			time.Sleep(interval)
+			interval = min(interval*2, channelEmotePollMaxInterval)
+
+			emotes, err := hc.GetChannelEmotes(tab.login)
+			if err != nil {
+				log.Printf("failed to load emotes for %s: %s", tab.login, err)
+				continue
+			}
+			if len(emotes) == 0 {
+				continue
+			}
+
+			signature := channelEmoteSignature(emotes)
+			if signature == last {
+				continue
+			}
+			last = signature
+			tab.chat.setEmotes(emotes)
+			window.Invalidate()
+		}
+	}()
+}
+
+func channelEmoteSignature(emotes []*hasherino.Emote) string {
+	entries := make([]string, 0, len(emotes))
+	for _, emote := range emotes {
+		if emote == nil {
+			continue
+		}
+		entries = append(entries, strconv.FormatInt(int64(emote.Source), 10)+":"+emote.Id+":"+emote.Name)
+	}
+	sort.Strings(entries)
+	return strings.Join(entries, "\x00")
 }
 
 func parseHexColor(value string) color.NRGBA {
@@ -920,18 +1067,138 @@ func layoutFlow(gtx layout.Context, spaceX, spaceY unit.Dp, widgets ...layout.Wi
 func newChat() *chat {
 	var list widget.List
 	list.Axis = layout.Vertical
-	return &chat{list: list, limit: defaultChatMessageLimit}
+	return &chat{
+		list:   list,
+		limit:  defaultChatMessageLimit,
+		emotes: make(map[string]*hasherino.Emote),
+	}
+}
+
+const chatEmoteDownloadTimeout = 20 * time.Second
+
+var (
+	chatEmoteClient = &http.Client{Timeout: chatEmoteDownloadTimeout}
+	chatEmoteMedia  = &chatEmoteMediaCache{
+		entries: make(map[string]*chatEmoteMediaEntry),
+	}
+)
+
+type chatEmoteMediaEntry struct {
+	media   *chatMedia
+	loading bool
+	failed  bool
+}
+
+// chatEmoteMediaCache keeps the decoded files of emotes in memory, shared by
+// every message and tab showing the same emote.
+type chatEmoteMediaCache struct {
+	mu      sync.Mutex
+	entries map[string]*chatEmoteMediaEntry
+}
+
+func chatEmoteKey(emote *hasherino.Emote) string {
+	return strconv.FormatInt(int64(emote.Source), 10) + ":" + emote.Id
+}
+
+func cachedChatEmoteMedia(emote *hasherino.Emote) *chatMedia {
+	if emote == nil {
+		return nil
+	}
+	chatEmoteMedia.mu.Lock()
+	defer chatEmoteMedia.mu.Unlock()
+	if entry, ok := chatEmoteMedia.entries[chatEmoteKey(emote)]; ok {
+		return entry.media
+	}
+	return nil
+}
+
+// requestChatEmoteMedia returns the media of the emote when it is already
+// loaded and reports whether the caller should start loading it.
+func requestChatEmoteMedia(emote *hasherino.Emote) (media *chatMedia, load bool) {
+	key := chatEmoteKey(emote)
+	chatEmoteMedia.mu.Lock()
+	defer chatEmoteMedia.mu.Unlock()
+	entry, ok := chatEmoteMedia.entries[key]
+	if !ok {
+		entry = &chatEmoteMediaEntry{}
+		chatEmoteMedia.entries[key] = entry
+	}
+	if entry.media != nil {
+		return entry.media, false
+	}
+	if entry.loading || entry.failed {
+		return nil, false
+	}
+	entry.loading = true
+	return nil, true
+}
+
+func finishChatEmoteMedia(emote *hasherino.Emote, media *chatMedia) {
+	chatEmoteMedia.mu.Lock()
+	defer chatEmoteMedia.mu.Unlock()
+	entry, ok := chatEmoteMedia.entries[chatEmoteKey(emote)]
+	if !ok {
+		entry = &chatEmoteMediaEntry{}
+		chatEmoteMedia.entries[chatEmoteKey(emote)] = entry
+	}
+	entry.loading = false
+	entry.media = media
+	entry.failed = media == nil
+}
+
+// loadChatEmote starts downloading and decoding the emote unless it is
+// already loaded or loading. The window is invalidated once it is ready.
+func loadChatEmote(window *app.Window, emote *hasherino.Emote) {
+	if emote == nil {
+		return
+	}
+	_, load := requestChatEmoteMedia(emote)
+	if !load {
+		return
+	}
+	go func() {
+		media, err := downloadChatEmote(emote)
+		if err != nil {
+			log.Printf("Failed to load emote %s: %s", emote.Name, err)
+			finishChatEmoteMedia(emote, nil)
+			return
+		}
+		finishChatEmoteMedia(emote, media)
+		window.Invalidate()
+	}()
+}
+
+func downloadChatEmote(emote *hasherino.Emote) (*chatMedia, error) {
+	url, err := emote.GetUrl()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := chatEmoteClient.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("downloading emote %s failed: %s", emote.Name, resp.Status)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return decodeChatMedia(data)
 }
 
 func decodeChatMedia(data []byte) (*chatMedia, error) {
 	if animation, err := gif.DecodeAll(bytes.NewReader(data)); err == nil {
-		frames := make([]image.Image, len(animation.Image))
-		delays := make([]time.Duration, len(animation.Delay))
-		for i, frame := range animation.Image {
-			frames[i] = frame
+		frames := composeGifFrames(animation)
+		if len(frames) == 0 {
+			return nil, errors.New("gif has no frames")
 		}
-		for i, delay := range animation.Delay {
-			delays[i] = time.Duration(delay) * 10 * time.Millisecond
+		delays := make([]time.Duration, len(frames))
+		for i := range delays {
+			if i < len(animation.Delay) {
+				delays[i] = time.Duration(animation.Delay[i]) * 10 * time.Millisecond
+			}
 		}
 		return newChatMedia(frames, delays), nil
 	}
@@ -943,6 +1210,72 @@ func decodeChatMedia(data []byte) (*chatMedia, error) {
 	return newChatMedia([]image.Image{img}, []time.Duration{0}), nil
 }
 
+// composeGifFrames draws every frame of the animation onto a canvas, honoring
+// the frame offsets and disposal methods, so that gifs that only store the
+// pixels that changed render completely and transparent areas do not keep
+// pixels from previous frames.
+func composeGifFrames(src *gif.GIF) []image.Image {
+	if len(src.Image) == 0 {
+		return nil
+	}
+
+	width, height := src.Config.Width, src.Config.Height
+	if width <= 0 || height <= 0 {
+		bounds := src.Image[0].Bounds()
+		width, height = bounds.Max.X, bounds.Max.Y
+	}
+	if width <= 0 || height <= 0 {
+		return nil
+	}
+
+	bounds := image.Rect(0, 0, width, height)
+	canvas := image.NewNRGBA(bounds)
+	frames := make([]image.Image, len(src.Image))
+	var restore *image.NRGBA
+	for i, frame := range src.Image {
+		if i > 0 {
+			switch gifDisposal(src, i-1) {
+			case gif.DisposalBackground:
+				// the previous frame is removed from the canvas, so its
+				// pixels do not show through transparent pixels of this one
+				previous := src.Image[i-1].Bounds().Intersect(bounds)
+				if !previous.Empty() {
+					draw.Draw(canvas, previous, image.Transparent, image.Point{}, draw.Src)
+				}
+			case gif.DisposalPrevious:
+				if restore != nil {
+					copy(canvas.Pix, restore.Pix)
+				}
+			}
+		}
+
+		var before *image.NRGBA
+		if gifDisposal(src, i) == gif.DisposalPrevious {
+			before = cloneNRGBA(canvas)
+		}
+
+		frameBounds := frame.Bounds()
+		draw.Draw(canvas, frameBounds, frame, frameBounds.Min, draw.Over)
+
+		frames[i] = cloneNRGBA(canvas)
+		restore = before
+	}
+	return frames
+}
+
+func gifDisposal(src *gif.GIF, frame int) byte {
+	if frame < 0 || frame >= len(src.Disposal) {
+		return gif.DisposalNone
+	}
+	return src.Disposal[frame]
+}
+
+func cloneNRGBA(src *image.NRGBA) *image.NRGBA {
+	dst := image.NewNRGBA(src.Bounds())
+	copy(dst.Pix, src.Pix)
+	return dst
+}
+
 func newChatMedia(frames []image.Image, delays []time.Duration) *chatMedia {
 	if len(delays) != len(frames) {
 		delays = make([]time.Duration, len(frames))
@@ -951,6 +1284,11 @@ func newChatMedia(frames []image.Image, delays []time.Duration) *chatMedia {
 		frames: make([]paint.ImageOp, len(frames)),
 		delays: delays,
 		start:  time.Now(),
+	}
+	if len(frames) > 0 {
+		bounds := frames[0].Bounds()
+		media.width = bounds.Dx()
+		media.height = bounds.Dy()
 	}
 	for i, frame := range frames {
 		media.frames[i] = paint.NewImageOp(frame)
@@ -995,6 +1333,7 @@ func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensio
 		Right:  unit.Dp(12),
 	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return material.List(theme, &c.list).Layout(gtx, len(messages), func(gtx layout.Context, index int) layout.Dimensions {
+			c.requestEmotes(messages[index])
 			return layoutChatMessage(gtx, theme, messages[index], now)
 		})
 	})
@@ -1065,13 +1404,41 @@ func layoutChatMedia(gtx layout.Context, media *chatMedia, now time.Time) layout
 }
 
 func layoutChatParts(gtx layout.Context, theme *material.Theme, message chatMessage, now time.Time) layout.Dimensions {
-	widgets := make([]layout.Widget, 0, len(message.parts))
+	widgets := make([]layout.Widget, 0, len(message.parts)+1)
+	if message.author != "" {
+		author := message.author + ": "
+		authorColor := message.authorColor
+		widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
+			return layoutInlineText(gtx, theme, author, authorColor)
+		})
+	}
 	for _, part := range message.parts {
 		part := part
+		if part.emote != nil {
+			media := part.media
+			if media == nil {
+				media = cachedChatEmoteMedia(part.emote)
+			}
+			if media == nil {
+				// the emote is still loading, so show its name until it
+				// is ready and the window is repainted
+				name := part.emote.Name
+				widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
+					return layoutInlineText(gtx, theme, name+" ", theme.Fg)
+				})
+				continue
+			}
+			widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
+				return layoutInlineEmote(gtx, media, now)
+			})
+			widgets = append(widgets, layoutInlineSpacer(unit.Dp(3)))
+			continue
+		}
 		if part.media != nil {
 			widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
 				return layoutInlineEmote(gtx, part.media, now)
 			})
+			widgets = append(widgets, layoutInlineSpacer(unit.Dp(3)))
 			continue
 		}
 		for _, word := range strings.Fields(part.text) {
@@ -1090,14 +1457,24 @@ func layoutInlineText(gtx layout.Context, theme *material.Theme, text string, co
 	return label.Layout(gtx)
 }
 
+func layoutInlineSpacer(width unit.Dp) layout.Widget {
+	return func(gtx layout.Context) layout.Dimensions {
+		return layout.Dimensions{Size: image.Point{X: gtx.Dp(width)}}
+	}
+}
+
 func layoutInlineEmote(gtx layout.Context, media *chatMedia, now time.Time) layout.Dimensions {
 	src, next := media.frame(now)
 	if !next.IsZero() {
 		gtx.Execute(op.InvalidateCmd{At: next})
 	}
-	size := gtx.Dp(unit.Dp(22))
+	height := gtx.Dp(unit.Dp(22))
+	width := height
+	if media.width > 0 && media.height > 0 {
+		width = height * media.width / media.height
+	}
 	gtx.Constraints.Min = image.Point{}
-	gtx.Constraints.Max = image.Point{X: size, Y: size}
+	gtx.Constraints.Max = image.Point{X: width, Y: height}
 	dims := widget.Image{Src: src, Fit: widget.Contain, Position: layout.Center}.Layout(gtx)
 	dims.Baseline = dims.Size.Y
 	return dims
@@ -1836,6 +2213,7 @@ func run(window *app.Window) error {
 		item := newTabItem(saved)
 		registerTabCallback(window, callbackMap, &item)
 		loadChatHistory(window, hc, &item)
+		loadChannelEmotes(window, hc, &item)
 		tabs = append(tabs, item)
 		tabIds = append(tabIds, saved.Id)
 		if selectedLogin != "" && strings.EqualFold(saved.Login, selectedLogin) {
@@ -1906,6 +2284,7 @@ func run(window *app.Window) error {
 					item := newTabItem(event.tab)
 					registerTabCallback(window, callbackMap, &item)
 					loadChatHistory(window, hc, &item)
+					loadChannelEmotes(window, hc, &item)
 					tabs = append(tabs, item)
 					selectedTab = len(tabs) - 1
 					if err := hc.SetSelectedTab(item.login); err != nil {
