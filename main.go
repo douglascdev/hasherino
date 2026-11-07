@@ -870,7 +870,7 @@ func layoutMessageInput(gtx layout.Context, theme *material.Theme, state *messag
 				return layout.Dimensions{}
 			}
 			offset := op.Offset(image.Pt(0, -(inputDims.Size.Y + gtx.Dp(unit.Dp(8))))).Push(gtx.Ops)
-			dims := layoutEmoteSuggestions(gtx, theme, state)
+			dims := layoutEmoteSuggestions(gtx, theme, state, window)
 			offset.Pop()
 			return dims
 		}),
@@ -967,13 +967,15 @@ func layoutMessageInputRow(gtx layout.Context, theme *material.Theme, state *mes
 	})
 }
 
-func layoutEmoteSuggestions(gtx layout.Context, theme *material.Theme, state *messageInputState) layout.Dimensions {
+func layoutEmoteSuggestions(gtx layout.Context, theme *material.Theme, state *messageInputState, window *app.Window) layout.Dimensions {
 	for i := range state.rows {
 		if state.rows[i].button.Clicked(gtx) {
 			state.acceptSuggestion(gtx, state.rows[i].emote.Name)
 			return layout.Dimensions{}
 		}
 	}
+
+	animator := chatAnimator{now: time.Now()}
 
 	width := gtx.Dp(unit.Dp(240))
 	if width > gtx.Constraints.Max.X {
@@ -1001,6 +1003,9 @@ func layoutEmoteSuggestions(gtx layout.Context, theme *material.Theme, state *me
 			for i := range state.rows {
 				i := i
 				row := &state.rows[i]
+				// Start loading the image as soon as the suggestion is shown;
+				// the window is repainted when it is ready.
+				loadChatEmote(window, row.emote)
 				children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return row.button.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 						return layout.Inset{
@@ -1009,12 +1014,24 @@ func layoutEmoteSuggestions(gtx layout.Context, theme *material.Theme, state *me
 							Left:   unit.Dp(8),
 							Right:  unit.Dp(8),
 						}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-							label := material.Body1(theme, row.emote.Name)
-							label.Color = theme.Fg
-							if i != state.selected {
-								label.Color.A = 0x99
+							widgets := make([]layout.FlexChild, 0, 3)
+							if media := cachedChatEmoteMedia(row.emote); media != nil {
+								widgets = append(widgets,
+									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+										return layoutInlineEmote(gtx, media, &animator)
+									}),
+									layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
+								)
 							}
-							return label.Layout(gtx)
+							widgets = append(widgets, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								label := material.Body1(theme, row.emote.Name)
+								label.Color = theme.Fg
+								if i != state.selected {
+									label.Color.A = 0x99
+								}
+								return label.Layout(gtx)
+							}))
+							return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx, widgets...)
 						})
 					})
 				}))
@@ -1023,7 +1040,9 @@ func layoutEmoteSuggestions(gtx layout.Context, theme *material.Theme, state *me
 		})
 	}
 
-	return layout.Background{}.Layout(gtx, background, content)
+	dims := layout.Background{}.Layout(gtx, background, content)
+	animator.invalidate(gtx)
+	return dims
 }
 
 type flowItem struct {
