@@ -3,11 +3,6 @@
 A Twitch chat client with support for Twitch and 7TV emotes, user badges, chat
 history, and a mobile-friendly settings dialog.
 
-The repository contains two frontends:
-
-- `main.go` — the Gio UI, used for the Flatpak, Windows, and Android builds.
-- `fyne_ui.go` — the Fyne UI.
-
 ## Install with Flatpak
 
 ### From a prebuilt bundle
@@ -62,7 +57,6 @@ flatpak run com.hashysoftware.hasherino
 
 Notes:
 
-- The Flatpak build compiles `main.go` (the Gio UI), not `fyne_ui.go`.
 - The first build downloads the Freedesktop SDK and Go SDK extension from
   Flathub, as well as the Go modules needed by the application.
 - The Flatpak requests network access, Wayland/X11, IPC, and GPU access.
