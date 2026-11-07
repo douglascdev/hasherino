@@ -86,10 +86,11 @@ func (hc *HasherinoController) NewWithClientID(callbackMap map[string]func(ChatM
 	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 		result = permDB.Create(&AppSettings{
 			ChatMessageLimit: 100,
-			ChatHistory:      false,
+			ChatHistory:      DefaultChatHistory,
 			ShowMessageTime:  DefaultShowMessageTime,
 			EmoteSize:        DefaultEmoteSize,
 			FontSize:         DefaultFontSize,
+			SettingsVersion:  currentSettingsVersion,
 		})
 	} else if result.Error != nil {
 		return nil, err
@@ -97,6 +98,7 @@ func (hc *HasherinoController) NewWithClientID(callbackMap map[string]func(ChatM
 	// settings created before the emote and font size settings existed have
 	// them set to zero, so they need to be filled with the defaults
 	missingDefaults := settings.EmoteSize == 0 || settings.FontSize == 0
+	changed := missingDefaults
 	if settings.EmoteSize == 0 {
 		settings.EmoteSize = DefaultEmoteSize
 	}
@@ -105,7 +107,17 @@ func (hc *HasherinoController) NewWithClientID(callbackMap map[string]func(ChatM
 	}
 	if missingDefaults {
 		settings.ShowMessageTime = DefaultShowMessageTime
-
+	}
+	if settings.SettingsVersion < currentSettingsVersion {
+		if settings.SettingsVersion < 1 {
+			// Chat history is on by default now; enable it once for
+			// installations created before that change.
+			settings.ChatHistory = DefaultChatHistory
+		}
+		settings.SettingsVersion = currentSettingsVersion
+		changed = true
+	}
+	if changed {
 		if err := permDB.Save(settings).Error; err != nil {
 			log.Println("Failed to save default settings:", err)
 		}

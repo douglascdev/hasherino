@@ -30,12 +30,18 @@ type AppSettings struct {
 	ShowMessageTime  bool
 	EmoteSize        int // Size chat emotes are rendered at, in pixels
 	FontSize         int // Size chat text is rendered at, in pixels
+	SettingsVersion  int // Version of the defaults last applied to these settings
 }
 
 const (
 	DefaultEmoteSize       = 36
 	DefaultFontSize        = 18
 	DefaultShowMessageTime = true
+	DefaultChatHistory     = true
+
+	// currentSettingsVersion is bumped when a default has to be applied to
+	// existing installations exactly once.
+	currentSettingsVersion = 1
 )
 
 // --- tempDB models ---

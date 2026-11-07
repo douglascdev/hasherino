@@ -29,6 +29,7 @@ import (
 	"gioui.org/op"
 	"gioui.org/op/clip"
 	"gioui.org/op/paint"
+	giotext "gioui.org/text"
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
@@ -93,6 +94,10 @@ type chat struct {
 	// badges are the badge image urls of the channel, keyed by badge set and
 	// version. They are replaced when the channel badges finish loading.
 	badges map[string]map[string]string
+	// showTime controls whether messages render their timestamp.
+	showTime bool
+	// emoteSize is the height inline emotes are rendered at.
+	emoteSize unit.Dp
 	// window is used to repaint the chat when an emote finishes loading.
 	window *app.Window
 }
@@ -121,6 +126,19 @@ func (c *chat) setLimit(limit int) {
 	if len(c.messages) > limit {
 		c.messages = c.messages[len(c.messages)-limit:]
 	}
+}
+
+// setShowTime controls whether timestamps are rendered before messages.
+func (c *chat) setShowTime(show bool) {
+	c.showTime = show
+}
+
+// setEmoteSize sets the height inline emotes are rendered at.
+func (c *chat) setEmoteSize(size int) {
+	if size <= 0 {
+		return
+	}
+	c.emoteSize = unit.Dp(float32(size))
 }
 
 // requestScrollToEnd asks the chat to scroll to its last message the next
@@ -337,6 +355,32 @@ type addTabState struct {
 	backdrop     widget.Clickable
 	addButton    widget.Clickable
 	cancelButton widget.Clickable
+}
+
+// settingsState holds the mobile-friendly settings dialog. It mirrors the
+// general options of the Fyne settings window and saves them through the
+// controller.
+type settingsState struct {
+	open bool
+
+	settings hasherino.AppSettings
+	loaded   bool
+	errText  string
+
+	backdrop   widget.Clickable
+	panel      widget.Clickable
+	doneButton widget.Clickable
+
+	// list keeps the scroll position of the settings.
+	list layout.List
+
+	chatLimitEditor widget.Editor
+	emoteSizeEditor widget.Editor
+	fontSizeEditor  widget.Editor
+	showTime        widget.Bool
+	chatHistory     widget.Bool
+
+	onSave func(hasherino.AppSettings)
 }
 
 const (
@@ -1177,9 +1221,11 @@ func newChat() *chat {
 	var list widget.List
 	list.Axis = layout.Vertical
 	return &chat{
-		list:   list,
-		limit:  defaultChatMessageLimit,
-		emotes: make(map[string]*hasherino.Emote),
+		list:      list,
+		limit:     defaultChatMessageLimit,
+		emotes:    make(map[string]*hasherino.Emote),
+		showTime:  true,
+		emoteSize: unit.Dp(22),
 	}
 }
 
@@ -1533,10 +1579,15 @@ const chatAnimationFrameInterval = 66 * time.Millisecond
 
 // chatAnimator collects the earliest time animated media needs a repaint during
 // a single layout. A single invalidation is scheduled for the whole window, so
-// many emotes do not each trigger their own full-window repaint.
+// many emotes do not each trigger their own full-window repaint. It also
+// carries the display options used while laying out the chat.
 type chatAnimator struct {
 	now  time.Time
 	next time.Time
+	// showTime controls whether message timestamps are laid out.
+	showTime bool
+	// emoteHeight is the pixel height of inline emotes.
+	emoteHeight int
 }
 
 func (a *chatAnimator) request(next time.Time) {
@@ -1561,7 +1612,11 @@ func (a *chatAnimator) invalidate(gtx layout.Context) {
 }
 
 func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensions {
-	animator := chatAnimator{now: time.Now()}
+	animator := chatAnimator{
+		now:         time.Now(),
+		showTime:    c.showTime,
+		emoteHeight: gtx.Dp(c.emoteSize),
+	}
 	messages := c.snapshot()
 	if c.takeScrollToEnd() {
 		c.list.ScrollToEnd = true
@@ -1653,7 +1708,7 @@ func layoutChatMedia(gtx layout.Context, media *chatMedia, animator *chatAnimato
 
 func layoutChatParts(gtx layout.Context, theme *material.Theme, message chatMessage, animator *chatAnimator) layout.Dimensions {
 	widgets := make([]layout.Widget, 0, len(message.parts)+len(message.badgeURLs)+2)
-	if !message.sentAt.IsZero() {
+	if animator.showTime && !message.sentAt.IsZero() {
 		sentAt := message.sentAt.Format(chatMessageTimeFormat)
 		timeColor := theme.Fg
 		timeColor.A = 0x99
@@ -1747,7 +1802,10 @@ func layoutChatBadge(gtx layout.Context, media *chatMedia) layout.Dimensions {
 func layoutInlineEmote(gtx layout.Context, media *chatMedia, animator *chatAnimator) layout.Dimensions {
 	src, next := media.frame(animator.now)
 	animator.request(next)
-	height := gtx.Dp(unit.Dp(22))
+	height := animator.emoteHeight
+	if height <= 0 {
+		height = gtx.Dp(unit.Dp(22))
+	}
 	width := height
 	if media.width > 0 && media.height > 0 {
 		width = height * media.width / media.height
@@ -2258,6 +2316,295 @@ func layoutAddTabContent(gtx layout.Context, theme *material.Theme, state *addTa
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
 }
 
+func newSettingsState() *settingsState {
+	state := &settingsState{
+		settings: hasherino.AppSettings{
+			ChatMessageLimit: 100,
+			ChatHistory:      hasherino.DefaultChatHistory,
+			ShowMessageTime:  hasherino.DefaultShowMessageTime,
+			EmoteSize:        hasherino.DefaultEmoteSize,
+			FontSize:         hasherino.DefaultFontSize,
+		},
+	}
+	state.list.Axis = layout.Vertical
+	for _, editor := range []*widget.Editor{&state.chatLimitEditor, &state.emoteSizeEditor, &state.fontSizeEditor} {
+		editor.SingleLine = true
+		editor.Filter = "0123456789"
+		editor.InputHint = key.HintNumeric
+		editor.Alignment = giotext.End
+	}
+	state.chatLimitEditor.SetText(strconv.Itoa(state.settings.ChatMessageLimit))
+	state.emoteSizeEditor.SetText(strconv.Itoa(state.settings.EmoteSize))
+	state.fontSizeEditor.SetText(strconv.Itoa(state.settings.FontSize))
+	state.showTime.Value = state.settings.ShowMessageTime
+	state.chatHistory.Value = state.settings.ChatHistory
+	return state
+}
+
+func applyAppSettings(theme *material.Theme, tabs []tabItem, settings hasherino.AppSettings) {
+	if settings.FontSize > 0 {
+		theme.TextSize = unit.Sp(float32(settings.FontSize))
+	}
+	for i := range tabs {
+		applyAppSettingsToChat(tabs[i].chat, settings)
+	}
+}
+
+func applyAppSettingsToChat(c *chat, settings hasherino.AppSettings) {
+	if c == nil {
+		return
+	}
+	c.setLimit(settings.ChatMessageLimit)
+	c.setShowTime(settings.ShowMessageTime)
+	c.setEmoteSize(settings.EmoteSize)
+}
+
+// load refreshes the values shown by the dialog.
+func (s *settingsState) load(hc *hasherino.HasherinoController) {
+	settings, err := hc.GetSettings()
+	if err != nil {
+		s.loaded = false
+		s.errText = err.Error()
+		return
+	}
+	s.settings = *settings
+	s.loaded = true
+	s.chatLimitEditor.SetText(strconv.Itoa(settings.ChatMessageLimit))
+	s.emoteSizeEditor.SetText(strconv.Itoa(settings.EmoteSize))
+	s.fontSizeEditor.SetText(strconv.Itoa(settings.FontSize))
+	s.showTime.Value = settings.ShowMessageTime
+	s.chatHistory.Value = settings.ChatHistory
+	s.errText = ""
+}
+
+// save persists the values in the dialog. It returns false when a value is
+// invalid, leaving the dialog open so the user can fix it.
+func (s *settingsState) save(hc *hasherino.HasherinoController) bool {
+	limit, err := strconv.Atoi(strings.TrimSpace(s.chatLimitEditor.Text()))
+	if err != nil || limit <= 0 {
+		s.errText = "Chat message limit must be a positive number."
+		return false
+	}
+	emoteSize, err := strconv.Atoi(strings.TrimSpace(s.emoteSizeEditor.Text()))
+	if err != nil || emoteSize <= 0 {
+		s.errText = "Emote size must be a positive number."
+		return false
+	}
+	fontSize, err := strconv.Atoi(strings.TrimSpace(s.fontSizeEditor.Text()))
+	if err != nil || fontSize <= 0 {
+		s.errText = "Font size must be a positive number."
+		return false
+	}
+
+	s.settings.ChatMessageLimit = limit
+	s.settings.EmoteSize = emoteSize
+	s.settings.FontSize = fontSize
+	s.settings.ShowMessageTime = s.showTime.Value
+	s.settings.ChatHistory = s.chatHistory.Value
+	if err := hc.SetSettings(&s.settings); err != nil {
+		s.errText = err.Error()
+		return false
+	}
+	s.errText = ""
+	if s.onSave != nil {
+		s.onSave(s.settings)
+	}
+	return true
+}
+
+func (s *settingsState) updateEditor(gtx layout.Context, editor *widget.Editor, hc *hasherino.HasherinoController) {
+	for {
+		event, ok := editor.Update(gtx)
+		if !ok {
+			return
+		}
+		if _, changed := event.(widget.ChangeEvent); changed {
+			// Invalid intermediate values show an error instead of being saved.
+			s.save(hc)
+		}
+	}
+}
+
+func (s *settingsState) update(gtx layout.Context, hc *hasherino.HasherinoController) {
+	if s.backdrop.Clicked(gtx) {
+		s.open = false
+		return
+	}
+	if s.doneButton.Clicked(gtx) {
+		if s.save(hc) {
+			s.open = false
+		}
+		return
+	}
+
+	if s.showTime.Update(gtx) {
+		s.save(hc)
+	}
+	if s.chatHistory.Update(gtx) {
+		s.save(hc)
+	}
+	s.updateEditor(gtx, &s.chatLimitEditor, hc)
+	s.updateEditor(gtx, &s.emoteSizeEditor, hc)
+	s.updateEditor(gtx, &s.fontSizeEditor, hc)
+}
+
+func layoutSettings(gtx layout.Context, theme *material.Theme, hc *hasherino.HasherinoController, state *settingsState) layout.Dimensions {
+	if !state.open {
+		return layout.Dimensions{}
+	}
+	state.update(gtx, hc)
+	if !state.open {
+		return layout.Dimensions{}
+	}
+	return layoutModal(gtx, &state.backdrop, func(gtx layout.Context) layout.Dimensions {
+		return layoutSettingsPanel(gtx, theme, state)
+	})
+}
+
+func layoutSettingsPanel(gtx layout.Context, theme *material.Theme, state *settingsState) layout.Dimensions {
+	margin := gtx.Dp(unit.Dp(16))
+	maxWidth := gtx.Constraints.Max.X - 2*margin
+	if maxWidth < gtx.Dp(unit.Dp(200)) {
+		maxWidth = gtx.Constraints.Max.X
+	}
+	width := gtx.Dp(unit.Dp(420))
+	if width > maxWidth {
+		width = maxWidth
+	}
+	height := gtx.Constraints.Max.Y - 2*margin
+	if height > gtx.Dp(unit.Dp(600)) {
+		height = gtx.Dp(unit.Dp(600))
+	}
+	if height < gtx.Dp(unit.Dp(240)) {
+		height = gtx.Constraints.Max.Y - gtx.Dp(unit.Dp(8))
+	}
+	if height > gtx.Constraints.Max.Y {
+		height = gtx.Constraints.Max.Y
+	}
+	if width < 0 {
+		width = 0
+	}
+	if height < 0 {
+		height = 0
+	}
+	gtx.Constraints.Min = image.Pt(width, height)
+	gtx.Constraints.Max = gtx.Constraints.Min
+
+	background := func(gtx layout.Context) layout.Dimensions {
+		size := gtx.Constraints.Min
+		radius := gtx.Dp(unit.Dp(10))
+		panel := color.NRGBA{R: 0x1e, G: 0x1e, B: 0x24, A: 0xff}
+		paint.FillShape(gtx.Ops, panel, clip.UniformRRect(image.Rectangle{Max: size}, radius).Op(gtx.Ops))
+		return layout.Dimensions{Size: size}
+	}
+
+	content := func(gtx layout.Context) layout.Dimensions {
+		return layout.Inset{
+			Top:    unit.Dp(16),
+			Bottom: unit.Dp(16),
+			Left:   unit.Dp(16),
+			Right:  unit.Dp(16),
+		}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			rows := state.settingsRows(theme)
+			return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return material.H6(theme, "Settings").Layout(gtx)
+				}),
+				layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
+				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+					return state.list.Layout(gtx, len(rows), func(gtx layout.Context, index int) layout.Dimensions {
+						return rows[index](gtx)
+					})
+				}),
+				layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layout.E.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return material.Button(theme, &state.doneButton, "Done").Layout(gtx)
+					})
+				}),
+			)
+		})
+	}
+
+	return state.panel.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Background{}.Layout(gtx, background, content)
+	})
+}
+
+func (s *settingsState) settingsRows(theme *material.Theme) []layout.Widget {
+	rows := []layout.Widget{
+		func(gtx layout.Context) layout.Dimensions {
+			return layoutSettingsField(gtx, theme, "Chat message limit", &s.chatLimitEditor, "100")
+		},
+		func(gtx layout.Context) layout.Dimensions {
+			return layoutSettingsToggle(gtx, theme, "Chat history", &s.chatHistory)
+		},
+		func(gtx layout.Context) layout.Dimensions {
+			return layoutSettingsToggle(gtx, theme, "Show message time", &s.showTime)
+		},
+		func(gtx layout.Context) layout.Dimensions {
+			return layoutSettingsField(gtx, theme, "Emote size", &s.emoteSizeEditor, "36")
+		},
+		func(gtx layout.Context) layout.Dimensions {
+			return layoutSettingsField(gtx, theme, "Font size", &s.fontSizeEditor, "18")
+		},
+	}
+	if s.errText != "" {
+		rows = append(rows, func(gtx layout.Context) layout.Dimensions {
+			label := material.Body1(theme, s.errText)
+			label.Color = color.NRGBA{R: 0xff, G: 0x90, B: 0x90, A: 0xff}
+			return label.Layout(gtx)
+		})
+	}
+	return rows
+}
+
+func layoutSettingsField(gtx layout.Context, theme *material.Theme, label string, editor *widget.Editor, hint string) layout.Dimensions {
+	maxWidth := gtx.Dp(unit.Dp(100))
+	if limit := gtx.Constraints.Max.X * 2 / 5; maxWidth > limit {
+		maxWidth = limit
+	}
+	if maxWidth < gtx.Dp(unit.Dp(48)) {
+		maxWidth = gtx.Dp(unit.Dp(48))
+	}
+	minWidth := gtx.Dp(unit.Dp(48))
+	if minWidth > maxWidth {
+		minWidth = maxWidth
+	}
+	return layout.Inset{Bottom: unit.Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				text := material.Body1(theme, label)
+				text.Color = theme.Fg
+				return text.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(12)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				gtx.Constraints.Min.X = minWidth
+				gtx.Constraints.Max.X = maxWidth
+				field := material.Editor(theme, editor, hint)
+				field.TextSize = unit.Sp(16)
+				return field.Layout(gtx)
+			}),
+		)
+	})
+}
+
+func layoutSettingsToggle(gtx layout.Context, theme *material.Theme, label string, value *widget.Bool) layout.Dimensions {
+	return layout.Inset{Bottom: unit.Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				text := material.Body1(theme, label)
+				text.Color = theme.Fg
+				return text.Layout(gtx)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return material.Switch(theme, value, "").Layout(gtx)
+			}),
+		)
+	})
+}
+
 func layoutDeviceAuthContent(gtx layout.Context, theme *material.Theme, state *deviceAuthState) layout.Dimensions {
 	children := []layout.FlexChild{
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -2509,6 +2856,17 @@ func run(window *app.Window) error {
 		startListening()
 	}
 
+	settings := newSettingsState()
+	settings.load(hc)
+	settings.onSave = func(appSettings hasherino.AppSettings) {
+		settings.settings = appSettings
+		applyAppSettings(theme, tabs, appSettings)
+		window.Invalidate()
+	}
+	if settings.loaded {
+		applyAppSettings(theme, tabs, settings.settings)
+	}
+
 	userAddIcon, err := widget.NewIcon(icons.SocialPersonAdd)
 	if err != nil {
 		return err
@@ -2556,6 +2914,7 @@ func run(window *app.Window) error {
 				case event.tab != nil:
 					addTab.pending = false
 					item := newTabItem(event.tab)
+					applyAppSettingsToChat(item.chat, settings.settings)
 					registerTabCallback(window, callbackMap, &item)
 					loadChatHistory(window, hc, &item)
 					loadChannelEmotes(window, hc, &item)
@@ -2576,9 +2935,12 @@ func run(window *app.Window) error {
 			paint.Fill(gtx.Ops, theme.Bg)
 
 			// While a modal dialog is open, the UI underneath must not react.
-			if !deviceAuth.open && !addTab.open {
+			if !deviceAuth.open && !addTab.open && !settings.open {
 				if settingsButton.Clicked(gtx) {
-					log.Println("settings clicked")
+					settings.load(hc)
+					settings.open = true
+					settings.list.Position = layout.Position{}
+					usersMenu.open = false
 				}
 
 				// Toggle the users dropdown.
@@ -2694,6 +3056,9 @@ func run(window *app.Window) error {
 						return layout.Dimensions{}
 					}
 					return layoutAddTab(gtx, theme, addTab)
+				}),
+				layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+					return layoutSettings(gtx, theme, hc, settings)
 				}),
 			)
 
