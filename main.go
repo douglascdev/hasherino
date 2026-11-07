@@ -26,6 +26,7 @@ import (
 	"gioui.org/app"
 	"gioui.org/io/clipboard"
 	"gioui.org/io/key"
+	"gioui.org/io/pointer"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -55,6 +56,22 @@ type chatPart struct {
 	text  string
 	emote *hasherino.Emote
 	media *chatMedia
+	// links holds one clickable per url found in the text part. It is shared
+	// across the message copies made during layout so click state persists.
+	links map[string]*widget.Clickable
+}
+
+// linkButton returns the persistent clickable for a url in this text part.
+func (p *chatPart) linkButton(url string) *widget.Clickable {
+	if p.links == nil {
+		p.links = make(map[string]*widget.Clickable)
+	}
+	button := p.links[url]
+	if button == nil {
+		button = new(widget.Clickable)
+		p.links[url] = button
+	}
+	return button
 }
 
 type chatMessage struct {
@@ -239,7 +256,10 @@ func (c *chat) buildPartsLocked(text string, ownEmotes map[string]*hasherino.Emo
 		if textPart.Len() == 0 {
 			return
 		}
-		parts = append(parts, chatPart{text: textPart.String()})
+		parts = append(parts, chatPart{
+			text:  textPart.String(),
+			links: make(map[string]*widget.Clickable),
+		})
 		textPart.Reset()
 	}
 
@@ -1767,12 +1787,119 @@ func layoutChatParts(gtx layout.Context, theme *material.Theme, message chatMess
 		}
 		for _, word := range strings.Fields(part.text) {
 			word := word
+			prefix, link, suffix := splitChatLink(word)
+			if link == "" {
+				widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
+					return layoutInlineText(gtx, theme, word+" ", theme.Fg)
+				})
+				continue
+			}
+			if prefix != "" {
+				prefix := prefix
+				widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
+					return layoutInlineText(gtx, theme, prefix, theme.Fg)
+				})
+			}
+			button := part.linkButton(link)
+			linkText := link
+			if suffix == "" {
+				linkText += " "
+			}
 			widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
-				return layoutInlineText(gtx, theme, word+" ", theme.Fg)
+				return layoutInlineLink(gtx, theme, button, linkText, link)
 			})
+			if suffix != "" {
+				suffix := suffix + " "
+				widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
+					return layoutInlineText(gtx, theme, suffix, theme.Fg)
+				})
+			}
 		}
 	}
 	return layoutInline(gtx, widgets...)
+}
+
+var (
+	chatLinkColor      = color.NRGBA{R: 0x6c, G: 0xa8, B: 0xff, A: 0xff}
+	chatLinkHoverColor = color.NRGBA{R: 0x93, G: 0xc4, B: 0xff, A: 0xff}
+)
+
+func looksLikeChatLink(link string) bool {
+	lower := strings.ToLower(link)
+	switch {
+	case strings.HasPrefix(lower, "www."):
+		rest := lower[len("www."):]
+		return rest != "" && strings.Contains(rest, ".")
+	case strings.HasPrefix(lower, "http://"):
+		return strings.Contains(lower[len("http://"):], ".")
+	case strings.HasPrefix(lower, "https://"):
+		return strings.Contains(lower[len("https://"):], ".")
+	}
+	return false
+}
+
+// splitChatLink separates a word into text before a url, the url itself, and
+// trailing punctuation that belongs to the sentence rather than the link.
+func splitChatLink(word string) (prefix, link, suffix string) {
+	lower := strings.ToLower(word)
+	start := -1
+	for _, candidate := range []string{"http://", "https://", "www."} {
+		if i := strings.Index(lower, candidate); i >= 0 && (start < 0 || i < start) {
+			start = i
+		}
+	}
+	if start < 0 {
+		return "", "", ""
+	}
+
+	candidate := word[start:]
+	end := len(candidate)
+trim:
+	for end > 0 {
+		switch c := candidate[end-1]; {
+		case strings.ContainsRune(".,;:!?\"'", rune(c)):
+			end--
+		case c == ')' && strings.Count(candidate[:end], ")") > strings.Count(candidate[:end], "("):
+			end--
+		case c == ']' && strings.Count(candidate[:end], "]") > strings.Count(candidate[:end], "["):
+			end--
+		default:
+			break trim
+		}
+	}
+
+	link = candidate[:end]
+	if !looksLikeChatLink(link) {
+		return "", "", ""
+	}
+	return word[:start], link, candidate[end:]
+}
+
+func normalizeChatLink(link string) string {
+	if strings.HasPrefix(strings.ToLower(link), "www.") {
+		return "https://" + link
+	}
+	return link
+}
+
+func layoutInlineLink(gtx layout.Context, theme *material.Theme, button *widget.Clickable, text, url string) layout.Dimensions {
+	if button.Clicked(gtx) {
+		link := normalizeChatLink(url)
+		go func() {
+			if err := openExternalURL(link); err != nil {
+				log.Printf("failed to open link %s: %s", link, err)
+			}
+		}()
+	}
+
+	linkColor := chatLinkColor
+	if button.Hovered() {
+		linkColor = chatLinkHoverColor
+	}
+	return button.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		pointer.CursorPointer.Add(gtx.Ops)
+		return layoutInlineText(gtx, theme, text, linkColor)
+	})
 }
 
 func layoutInlineText(gtx layout.Context, theme *material.Theme, text string, col color.NRGBA) layout.Dimensions {
