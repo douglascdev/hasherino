@@ -39,4 +39,5 @@ modules:
         skip:
           - .git
           - .flatpak-builder
+          - dist
           - '*.flatpak'

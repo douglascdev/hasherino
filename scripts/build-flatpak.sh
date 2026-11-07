@@ -4,13 +4,13 @@
 #
 # Run from the repository checkout with the Nix dev shell active:
 #
-#   nix develop -c ./build-flatpak.sh
+#   nix develop -c ./scripts/build-flatpak.sh
 #
 # An optional first argument sets the output path of the .flatpak bundle.
 
 set -euo pipefail
 
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_ID="com.hashysoftware.hasherino"
 MANIFEST="$ROOT_DIR/flatpak/$APP_ID.yml"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/hasherino-flatpak"
