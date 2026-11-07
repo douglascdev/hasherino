@@ -1475,9 +1475,7 @@ func layoutInlineEmote(gtx layout.Context, media *chatMedia, now time.Time) layo
 	}
 	gtx.Constraints.Min = image.Point{}
 	gtx.Constraints.Max = image.Point{X: width, Y: height}
-	dims := widget.Image{Src: src, Fit: widget.Contain, Position: layout.Center}.Layout(gtx)
-	dims.Baseline = dims.Size.Y
-	return dims
+	return widget.Image{Src: src, Fit: widget.Contain, Position: layout.Center}.Layout(gtx)
 }
 
 // layoutInline lays out widgets like words in a paragraph, wrapping to a new
@@ -1501,7 +1499,6 @@ func layoutInline(gtx layout.Context, widgets ...layout.Widget) layout.Dimension
 	type inlineRow struct {
 		items  []inlineItem
 		width  int
-		ascent int
 		height int
 	}
 	var rows []inlineRow
@@ -1519,16 +1516,11 @@ func layoutInline(gtx layout.Context, widgets ...layout.Widget) layout.Dimension
 	}
 
 	for i := range rows {
-		descent := 0
 		for _, item := range rows[i].items {
-			if item.dims.Baseline > rows[i].ascent {
-				rows[i].ascent = item.dims.Baseline
-			}
-			if d := item.dims.Size.Y - item.dims.Baseline; d > descent {
-				descent = d
+			if item.dims.Size.Y > rows[i].height {
+				rows[i].height = item.dims.Size.Y
 			}
 		}
-		rows[i].height = rows[i].ascent + descent
 	}
 
 	contentWidth := 0
@@ -1539,7 +1531,9 @@ func layoutInline(gtx layout.Context, widgets ...layout.Widget) layout.Dimension
 		}
 		x := 0
 		for _, item := range row.items {
-			pos := image.Point{X: x, Y: y + row.ascent - item.dims.Baseline}
+			// Center every item vertically in its line, like the Fyne flow
+			// layout does, so emotes sit next to the text instead of above it.
+			pos := image.Point{X: x, Y: y + (row.height-item.dims.Size.Y)/2}
 			offset := op.Offset(pos).Push(gtx.Ops)
 			item.call.Add(gtx.Ops)
 			offset.Pop()
