@@ -25,6 +25,7 @@ import (
 
 	"gioui.org/app"
 	"gioui.org/io/clipboard"
+	"gioui.org/io/event"
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
@@ -74,6 +75,22 @@ func (p *chatPart) linkButton(url string) *widget.Clickable {
 	return button
 }
 
+// chatMessageMenu holds the persistent click state for a message's actions
+// menu. One menu is shared by all copies of a message made during layout.
+type chatMessageMenu struct {
+	copyButton     widget.Clickable
+	copyFullButton widget.Clickable
+	panel          widget.Clickable
+}
+
+// chatMessageMenuState tracks which message menu is currently open in a chat,
+// along with the data needed to render and copy it.
+type chatMessageMenuState struct {
+	open    *chatMessageMenu
+	message chatMessage
+	anchorX int
+}
+
 type chatMessage struct {
 	author      string
 	authorColor color.NRGBA
@@ -88,6 +105,8 @@ type chatMessage struct {
 	// image urls are resolved from the channel's badge sets into badgeURLs.
 	rawBadges []hasherino.Badge
 	badgeURLs []string
+	// menu is the persistent action menu state for this message.
+	menu *chatMessageMenu
 }
 
 type chatMedia struct {
@@ -115,6 +134,8 @@ type chat struct {
 	showTime bool
 	// emoteSize is the height inline emotes are rendered at.
 	emoteSize unit.Dp
+	// menu tracks which message's actions menu is open.
+	menu chatMessageMenuState
 	// window is used to repaint the chat when an emote finishes loading.
 	window *app.Window
 }
@@ -185,6 +206,9 @@ func (c *chat) append(message chatMessage) {
 	}
 	message.parts = c.buildPartsLocked(message.text, message.ownEmotes)
 	message.badgeURLs = c.resolveBadgesLocked(message.rawBadges)
+	if message.menu == nil {
+		message.menu = &chatMessageMenu{}
+	}
 	c.messages = append(c.messages, message)
 	if len(c.messages) > c.limit {
 		c.messages = c.messages[len(c.messages)-c.limit:]
@@ -1610,6 +1634,8 @@ type chatAnimator struct {
 	showTime bool
 	// emoteHeight is the pixel height of inline emotes.
 	emoteHeight int
+	// menu tracks the currently open message actions menu.
+	menu *chatMessageMenuState
 }
 
 func (a *chatAnimator) request(next time.Time) {
@@ -1638,6 +1664,7 @@ func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensio
 		now:         time.Now(),
 		showTime:    c.showTime,
 		emoteHeight: gtx.Dp(c.emoteSize),
+		menu:        &c.menu,
 	}
 	messages := c.snapshot()
 	if c.takeScrollToEnd() {
@@ -1651,22 +1678,91 @@ func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensio
 		Left:   unit.Dp(12),
 		Right:  unit.Dp(12),
 	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return material.List(theme, &c.list).Layout(gtx, len(messages), func(gtx layout.Context, index int) layout.Dimensions {
+		heights := make(map[int]int)
+		dims := material.List(theme, &c.list).Layout(gtx, len(messages), func(gtx layout.Context, index int) layout.Dimensions {
 			c.requestEmotes(messages[index])
 			c.requestBadges(messages[index])
-			dims := layoutChatMessage(gtx, theme, messages[index], &animator)
+			itemDims := layoutChatMessage(gtx, theme, messages[index], &animator)
+			heights[index] = itemDims.Size.Y
 			// Report the full available width even for short messages.
 			// Otherwise the list sizes itself to the widest visible message,
 			// and its scrollbar shifts horizontally as messages scroll by.
-			dims.Size.X = gtx.Constraints.Max.X
-			return dims
+			itemDims.Size.X = gtx.Constraints.Max.X
+			return itemDims
 		})
+		c.layoutMenuOverlay(gtx, theme, messages, heights)
+		return dims
 	})
 	animator.invalidate(gtx)
 	return dims
 }
 
 func layoutChatMessage(gtx layout.Context, theme *material.Theme, message chatMessage, animator *chatAnimator) layout.Dimensions {
+	content := func(gtx layout.Context) layout.Dimensions {
+		return layoutChatMessageContent(gtx, theme, message, animator)
+	}
+
+	// Measure and record the content. The right-click handler is added after
+	// replaying the content so it sits above links, while PassOp keeps it from
+	// blocking their primary clicks.
+	macro := op.Record(gtx.Ops)
+	dims := content(gtx)
+	call := macro.Stop()
+
+	handlerEnabled := message.menu != nil && animator != nil && animator.menu != nil &&
+		strings.TrimSpace(message.text) != ""
+	if handlerEnabled {
+		for {
+			ev, ok := gtx.Event(pointer.Filter{
+				Target: message.menu,
+				Kinds:  pointer.Press,
+			})
+			if !ok {
+				break
+			}
+			e, ok := ev.(pointer.Event)
+			if !ok || e.Kind != pointer.Press || e.Source != pointer.Mouse {
+				continue
+			}
+			switch {
+			case e.Buttons.Contain(pointer.ButtonSecondary):
+				if animator.menu.open == message.menu {
+					animator.menu.open = nil
+				} else {
+					animator.menu.open = message.menu
+					animator.menu.message = message
+					animator.menu.anchorX = e.Position.Round().X
+				}
+				gtx.Execute(op.InvalidateCmd{})
+			case e.Buttons.Contain(pointer.ButtonPrimary):
+				if animator.menu.open != nil {
+					animator.menu.open = nil
+					gtx.Execute(op.InvalidateCmd{})
+				}
+			}
+		}
+	}
+
+	drawContent := func(gtx layout.Context) layout.Dimensions {
+		call.Add(gtx.Ops)
+		if handlerEnabled {
+			area := dims.Size
+			if gtx.Constraints.Max.X > area.X {
+				area.X = gtx.Constraints.Max.X
+			}
+			clipStack := clip.Rect(image.Rectangle{Max: area}).Push(gtx.Ops)
+			pass := pointer.PassOp{}.Push(gtx.Ops)
+			event.Op(gtx.Ops, message.menu)
+			pass.Pop()
+			clipStack.Pop()
+		}
+		return dims
+	}
+
+	return drawContent(gtx)
+}
+
+func layoutChatMessageContent(gtx layout.Context, theme *material.Theme, message chatMessage, animator *chatAnimator) layout.Dimensions {
 	if len(message.parts) > 0 {
 		return layoutChatParts(gtx, theme, message, animator)
 	}
@@ -1817,6 +1913,169 @@ func layoutChatParts(gtx layout.Context, theme *material.Theme, message chatMess
 		}
 	}
 	return layoutInline(gtx, widgets...)
+}
+
+// layoutMenuOverlay draws the open message actions menu on top of the chat
+// list. It is rendered after the list so it does not change the list layout.
+func (c *chat) layoutMenuOverlay(gtx layout.Context, theme *material.Theme, messages []chatMessage, heights map[int]int) {
+	menu := c.menu.open
+	if menu == nil {
+		return
+	}
+
+	if menu.copyButton.Clicked(gtx) {
+		c.writeClipboard(gtx, c.menu.message.text)
+		c.menu.open = nil
+		gtx.Execute(op.InvalidateCmd{})
+		return
+	}
+	if menu.copyFullButton.Clicked(gtx) {
+		c.writeClipboard(gtx, fullChatMessageText(c.menu.message))
+		c.menu.open = nil
+		gtx.Execute(op.InvalidateCmd{})
+		return
+	}
+	// Consume clicks on the panel background so they don't reach the message.
+	menu.panel.Clicked(gtx)
+
+	index := -1
+	for i := range messages {
+		if messages[i].menu == menu {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return
+	}
+	itemHeight, ok := heights[index]
+	if !ok {
+		return
+	}
+	first := c.list.Position.First
+	if index < first {
+		return
+	}
+	y := -c.list.Position.Offset
+	for j := first; j < index; j++ {
+		h, ok := heights[j]
+		if !ok {
+			return
+		}
+		y += h + c.list.Gap
+	}
+
+	// Measure the panel first, then replay it at its final position.
+	macro := op.Record(gtx.Ops)
+	panelDims := layoutChatMenuPanel(gtx, theme, &c.menu)
+	panelCall := macro.Stop()
+
+	maxX := gtx.Constraints.Max.X
+	x := c.menu.anchorX
+	if x+panelDims.Size.X > maxX {
+		x = maxX - panelDims.Size.X
+	}
+	if x < 0 {
+		x = 0
+	}
+	gap := gtx.Dp(unit.Dp(4))
+	below := y + itemHeight + gap
+	above := y - panelDims.Size.Y - gap
+	menuY := below
+	if menuY+panelDims.Size.Y > gtx.Constraints.Max.Y && above >= 0 {
+		menuY = above
+	}
+	if menuY+panelDims.Size.Y > gtx.Constraints.Max.Y {
+		menuY = gtx.Constraints.Max.Y - panelDims.Size.Y
+	}
+	if menuY < 0 {
+		menuY = 0
+	}
+
+	offset := op.Offset(image.Pt(x, menuY)).Push(gtx.Ops)
+	panelCall.Add(gtx.Ops)
+	offset.Pop()
+}
+
+func (c *chat) writeClipboard(gtx layout.Context, text string) {
+	gtx.Execute(clipboard.WriteCmd{
+		Type: "text/plain",
+		Data: io.NopCloser(strings.NewReader(text)),
+	})
+}
+
+func fullChatMessageText(message chatMessage) string {
+	var b strings.Builder
+	if !message.sentAt.IsZero() {
+		b.WriteString(message.sentAt.Format(chatMessageTimeFormat))
+		b.WriteByte(' ')
+	}
+	if message.author != "" {
+		b.WriteString(message.author)
+		b.WriteString(": ")
+	}
+	b.WriteString(message.text)
+	return b.String()
+}
+
+// layoutChatMenuPanel renders the dropdown shown when right-clicking a message.
+func layoutChatMenuPanel(gtx layout.Context, theme *material.Theme, state *chatMessageMenuState) layout.Dimensions {
+	menu := state.open
+	if menu == nil {
+		return layout.Dimensions{}
+	}
+
+	width := gtx.Dp(unit.Dp(190))
+	if width > gtx.Constraints.Max.X {
+		width = gtx.Constraints.Max.X
+	}
+	if width < 0 {
+		width = 0
+	}
+
+	background := func(gtx layout.Context) layout.Dimensions {
+		size := gtx.Constraints.Min
+		radius := gtx.Dp(unit.Dp(6))
+		panel := color.NRGBA{R: 0x1e, G: 0x1e, B: 0x24, A: 0xff}
+		paint.FillShape(gtx.Ops, panel, clip.UniformRRect(image.Rectangle{Max: size}, radius).Op(gtx.Ops))
+		return layout.Dimensions{Size: size}
+	}
+	content := func(gtx layout.Context) layout.Dimensions {
+		return layout.UniformInset(unit.Dp(4)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layoutChatMenuItem(gtx, theme, &menu.copyButton, "Copy message")
+				}),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layoutChatMenuItem(gtx, theme, &menu.copyFullButton, "Copy full message")
+				}),
+			)
+		})
+	}
+	return menu.panel.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		gtx.Constraints.Min.X = width
+		gtx.Constraints.Max.X = width
+		gtx.Constraints.Min.Y = 0
+		return layout.Background{}.Layout(gtx, background, content)
+	})
+}
+
+func layoutChatMenuItem(gtx layout.Context, theme *material.Theme, button *widget.Clickable, text string) layout.Dimensions {
+	return button.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		pointer.CursorPointer.Add(gtx.Ops)
+		return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				return layout.UniformInset(unit.Dp(8)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					label := material.Body1(theme, text)
+					label.Color = theme.Fg
+					if !button.Hovered() {
+						label.Color.A = 0xcc
+					}
+					return label.Layout(gtx)
+				})
+			}),
+		)
+	})
 }
 
 var (
