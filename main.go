@@ -1335,15 +1335,48 @@ func (m *chatMedia) frame(now time.Time) (paint.ImageOp, time.Time) {
 	return m.frames[0], now.Add(m.delays[0])
 }
 
+// chatAnimationFrameInterval caps how often animated media repaints. It matches
+// the ticker Fyne uses for GIF emotes.
+const chatAnimationFrameInterval = 66 * time.Millisecond
+
+// chatAnimator collects the earliest time animated media needs a repaint during
+// a single layout. A single invalidation is scheduled for the whole window, so
+// many emotes do not each trigger their own full-window repaint.
+type chatAnimator struct {
+	now  time.Time
+	next time.Time
+}
+
+func (a *chatAnimator) request(next time.Time) {
+	if next.IsZero() {
+		return
+	}
+	// Do not repaint faster than the shared frame interval. Frames are picked
+	// from the wall clock when they are drawn, so faster GIFs simply skip
+	// frames instead of forcing extra repaints.
+	if capped := a.now.Add(chatAnimationFrameInterval); next.Before(capped) {
+		next = capped
+	}
+	if a.next.IsZero() || next.Before(a.next) {
+		a.next = next
+	}
+}
+
+func (a *chatAnimator) invalidate(gtx layout.Context) {
+	if !a.next.IsZero() {
+		gtx.Execute(op.InvalidateCmd{At: a.next})
+	}
+}
+
 func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensions {
-	now := time.Now()
+	animator := chatAnimator{now: time.Now()}
 	messages := c.snapshot()
 	if c.takeScrollToEnd() {
 		c.list.ScrollToEnd = true
 		c.list.Position.BeforeEnd = false
 	}
 	c.list.Gap = gtx.Dp(unit.Dp(8))
-	return layout.Inset{
+	dims := layout.Inset{
 		Top:    unit.Dp(8),
 		Bottom: unit.Dp(8),
 		Left:   unit.Dp(12),
@@ -1351,14 +1384,16 @@ func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensio
 	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return material.List(theme, &c.list).Layout(gtx, len(messages), func(gtx layout.Context, index int) layout.Dimensions {
 			c.requestEmotes(messages[index])
-			return layoutChatMessage(gtx, theme, messages[index], now)
+			return layoutChatMessage(gtx, theme, messages[index], &animator)
 		})
 	})
+	animator.invalidate(gtx)
+	return dims
 }
 
-func layoutChatMessage(gtx layout.Context, theme *material.Theme, message chatMessage, now time.Time) layout.Dimensions {
+func layoutChatMessage(gtx layout.Context, theme *material.Theme, message chatMessage, animator *chatAnimator) layout.Dimensions {
 	if len(message.parts) > 0 {
-		return layoutChatParts(gtx, theme, message, now)
+		return layoutChatParts(gtx, theme, message, animator)
 	}
 
 	switch {
@@ -1371,7 +1406,7 @@ func layoutChatMessage(gtx layout.Context, theme *material.Theme, message chatMe
 			maxWidth = gtx.Dp(unit.Dp(320))
 		}
 		gtx.Constraints.Max = image.Point{X: maxWidth, Y: gtx.Dp(unit.Dp(220))}
-		return layoutChatMedia(gtx, message.media, now)
+		return layoutChatMedia(gtx, message.media, animator)
 	default:
 		// Text and media share a row, with the image on the left.
 		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
@@ -1382,7 +1417,7 @@ func layoutChatMessage(gtx layout.Context, theme *material.Theme, message chatMe
 					maxWidth = gtx.Dp(unit.Dp(200))
 				}
 				gtx.Constraints.Max = image.Point{X: maxWidth, Y: gtx.Dp(unit.Dp(160))}
-				return layoutChatMedia(gtx, message.media, now)
+				return layoutChatMedia(gtx, message.media, animator)
 			}),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(12)}.Layout),
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
@@ -1411,16 +1446,14 @@ func layoutChatText(gtx layout.Context, theme *material.Theme, message chatMessa
 	)
 }
 
-func layoutChatMedia(gtx layout.Context, media *chatMedia, now time.Time) layout.Dimensions {
-	src, next := media.frame(now)
-	if !next.IsZero() {
-		gtx.Execute(op.InvalidateCmd{At: next})
-	}
+func layoutChatMedia(gtx layout.Context, media *chatMedia, animator *chatAnimator) layout.Dimensions {
+	src, next := media.frame(animator.now)
+	animator.request(next)
 	img := widget.Image{Src: src, Fit: widget.Contain, Position: layout.W}
 	return img.Layout(gtx)
 }
 
-func layoutChatParts(gtx layout.Context, theme *material.Theme, message chatMessage, now time.Time) layout.Dimensions {
+func layoutChatParts(gtx layout.Context, theme *material.Theme, message chatMessage, animator *chatAnimator) layout.Dimensions {
 	widgets := make([]layout.Widget, 0, len(message.parts)+1)
 	if message.author != "" {
 		author := message.author + ": "
@@ -1446,14 +1479,14 @@ func layoutChatParts(gtx layout.Context, theme *material.Theme, message chatMess
 				continue
 			}
 			widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
-				return layoutInlineEmote(gtx, media, now)
+				return layoutInlineEmote(gtx, media, animator)
 			})
 			widgets = append(widgets, layoutInlineSpacer(unit.Dp(3)))
 			continue
 		}
 		if part.media != nil {
 			widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
-				return layoutInlineEmote(gtx, part.media, now)
+				return layoutInlineEmote(gtx, part.media, animator)
 			})
 			widgets = append(widgets, layoutInlineSpacer(unit.Dp(3)))
 			continue
@@ -1480,11 +1513,9 @@ func layoutInlineSpacer(width unit.Dp) layout.Widget {
 	}
 }
 
-func layoutInlineEmote(gtx layout.Context, media *chatMedia, now time.Time) layout.Dimensions {
-	src, next := media.frame(now)
-	if !next.IsZero() {
-		gtx.Execute(op.InvalidateCmd{At: next})
-	}
+func layoutInlineEmote(gtx layout.Context, media *chatMedia, animator *chatAnimator) layout.Dimensions {
+	src, next := media.frame(animator.now)
+	animator.request(next)
 	height := gtx.Dp(unit.Dp(22))
 	width := height
 	if media.width > 0 && media.height > 0 {
