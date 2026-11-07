@@ -1,57 +1,113 @@
-name: Go
+name: Build
 
 on:
   push:
-    tags:        
+    tags:
       - '*'
+  workflow_dispatch:
 
 jobs:
-
-  build:
+  linux:
+    name: Linux (Flatpak)
     runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.22'
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
 
-    - name: Install fyne-cross
-      run: go install github.com/fyne-io/fyne-cross@latest
+      # flatpak-builder needs unprivileged user namespaces on Ubuntu 24.04.
+      - name: Allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
 
-    - name: Build Linux Binary
-      run: fyne-cross linux -arch=amd64 -app-id com.hashysoftware.hasherino
+      - name: Build Flatpak
+        run: nix develop -c ./scripts/build-flatpak.sh
 
-    - name: Build Windows Binary
-      run: fyne-cross windows -arch=amd64 -app-id com.hashysoftware.hasherino
+      - name: Upload Flatpak
+        uses: actions/upload-artifact@v4
+        with:
+          name: hasherino-linux
+          path: com.hashysoftware.hasherino.flatpak
+          if-no-files-found: error
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: hasherino
-        path: |
-          fyne-cross/dist/
+  windows:
+    name: Windows
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Build Windows executable
+        run: nix develop .#windows -c ./scripts/build-windows.sh
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: hasherino-windows
+          path: dist/hasherino-windows-amd64.exe
+          if-no-files-found: error
+
+  android:
+    name: Android
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Android SDK/NDK and the Nix store need room on the runner.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo docker image prune -af || true
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Build Android APK
+        run: nix develop .#android -c ./scripts/build-android.sh
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: hasherino-android
+          path: dist/hasherino-android.apk
+          if-no-files-found: error
 
   release:
+    name: Release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [linux, windows, android]
+    if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
-
+      actions: read
     steps:
-    - name: Download artifacts
-      uses: actions/download-artifact@v4
-      with:
-        name: hasherino
-        path: clean-dist
-    
-    - name: Release
-      uses: softprops/action-gh-release@v2
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        body_path: CHANGELOG.md
-        files: |
-          clean-dist/linux-amd64/*
-          clean-dist/windows-amd64/*
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: clean-dist
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body_path: CHANGELOG.md
+          files: clean-dist/*
