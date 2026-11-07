@@ -60,6 +60,7 @@ type chatMessage struct {
 	author      string
 	authorColor color.NRGBA
 	text        string
+	sentAt      time.Time
 	media       *chatMedia
 	parts       []chatPart
 	// ownEmotes are the emotes the message itself carries from its irc tags,
@@ -98,6 +99,9 @@ type chat struct {
 
 const (
 	defaultChatMessageLimit = 500
+
+	// chatMessageTimeFormat matches the timestamp format the Fyne UI uses.
+	chatMessageTimeFormat = "15:04"
 
 	// The emotes of a channel are loaded in the background after its tab is
 	// created. The first checks are fast so freshly loaded emotes are picked
@@ -700,6 +704,7 @@ func registerTabCallback(window *app.Window, callbackMap map[string]func(hasheri
 			author:      message.Author,
 			authorColor: parseHexColor(message.AuthorColor),
 			text:        message.Text,
+			sentAt:      message.Time,
 			ownEmotes:   message.Emotes,
 			rawBadges:   message.Badges,
 		})
@@ -747,6 +752,7 @@ func loadChatHistory(window *app.Window, hc *hasherino.HasherinoController, tab 
 				author:      message.Author,
 				authorColor: parseHexColor(message.AuthorColor),
 				text:        message.Text,
+				sentAt:      message.Time,
 				ownEmotes:   message.Emotes,
 				rawBadges:   message.Badges,
 			})
@@ -1646,7 +1652,16 @@ func layoutChatMedia(gtx layout.Context, media *chatMedia, animator *chatAnimato
 }
 
 func layoutChatParts(gtx layout.Context, theme *material.Theme, message chatMessage, animator *chatAnimator) layout.Dimensions {
-	widgets := make([]layout.Widget, 0, len(message.parts)+1)
+	widgets := make([]layout.Widget, 0, len(message.parts)+len(message.badgeURLs)+2)
+	if !message.sentAt.IsZero() {
+		sentAt := message.sentAt.Format(chatMessageTimeFormat)
+		timeColor := theme.Fg
+		timeColor.A = 0x99
+		widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
+			return layoutInlineText(gtx, theme, sentAt, timeColor)
+		})
+		widgets = append(widgets, layoutInlineSpacer(unit.Dp(6)))
+	}
 	for _, url := range message.badgeURLs {
 		media := cachedChatBadgeMedia(url)
 		if media == nil {
