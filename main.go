@@ -624,11 +624,25 @@ func newTabItem(tab *hasherino.Tab) tabItem {
 	}
 }
 
+// shouldRenderChatMessage reports whether the message is a real user message.
+// Twitch sends system messages as PRIVMSGs from its own IRC services, like
+// tmi.twitch.tv and jtv, which must not show up in chat.
+func shouldRenderChatMessage(message hasherino.ChatMessage) bool {
+	if message.Command != "PRIVMSG" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(message.Author)) {
+	case "", "tmi.twitch.tv", "tmi", "jtv":
+		return false
+	}
+	return true
+}
+
 func registerTabCallback(window *app.Window, callbackMap map[string]func(hasherino.ChatMessage), tab *tabItem) {
 	chat := tab.chat
 	chat.window = window
 	callbackMap[tab.login] = func(message hasherino.ChatMessage) {
-		if message.Command != "PRIVMSG" {
+		if !shouldRenderChatMessage(message) {
 			return
 		}
 		chat.append(chatMessage{
@@ -674,6 +688,9 @@ func loadChatHistory(window *app.Window, hc *hasherino.HasherinoController, tab 
 
 		chat := tab.chat
 		for _, message := range messages {
+			if !shouldRenderChatMessage(message) {
+				continue
+			}
 			chat.append(chatMessage{
 				author:      message.Author,
 				authorColor: parseHexColor(message.AuthorColor),
