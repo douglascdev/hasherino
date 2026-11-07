@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Hasherino
+Comment=Twitch chat client
+Exec=hasherino
+Icon=com.hashysoftware.hasherino
+Terminal=false
+Categories=Network;Chat;InstantMessaging;
+Keywords=twitch;chat;emotes;badges;
+StartupWMClass=com.hashysoftware.hasherino

@@ -14,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,7 +38,6 @@ import (
 	_ "golang.org/x/image/webp"
 
 	"github.com/Hashy-Software/hasherino-go/hasherino"
-	"github.com/pkg/browser"
 )
 
 const deviceClientID = "9ofmajflpp4p2hrq81vjdyvcwlad97"
@@ -332,12 +332,14 @@ type deviceAuthState struct {
 	userCode        string
 	verificationURI string
 	errText         string
+	openErr         string
 	events          <-chan deviceAuthEvent
 	cancel          context.CancelFunc
 	onAccount       func(id, login, token string) error
 	backdrop        widget.Clickable
 	openButton      widget.Clickable
 	copyButton      widget.Clickable
+	copyLinkButton  widget.Clickable
 	closeButton     widget.Clickable
 }
 
@@ -2181,6 +2183,39 @@ func layoutMenuIconButton(gtx layout.Context, theme *material.Theme, button *wid
 	return style.Layout(gtx)
 }
 
+// openExternalURL opens url with the first available browser launcher. The
+// launcher's output is captured so platform diagnostics, such as a missing
+// desktop portal, do not get printed to the application's terminal.
+func openExternalURL(url string) error {
+	providers := []string{"xdg-open", "x-www-browser", "www-browser"}
+	var lastErr error
+	for _, provider := range providers {
+		path, err := exec.LookPath(provider)
+		if err != nil {
+			continue
+		}
+		cmd := exec.Command(path, url)
+		var output bytes.Buffer
+		cmd.Stdout = &output
+		cmd.Stderr = &output
+		if err := cmd.Run(); err != nil {
+			lastErr = err
+			continue
+		}
+		if bytes.Contains(output.Bytes(), []byte("Failed to call portal")) {
+			// xdg-open can exit successfully even though the portal call
+			// failed, for example when the host has no usable portal.
+			lastErr = errors.New("browser launcher could not reach the desktop portal")
+			continue
+		}
+		return nil
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return errors.New("no browser launcher found")
+}
+
 func layoutDeviceAuth(gtx layout.Context, theme *material.Theme, state *deviceAuthState) layout.Dimensions {
 	// Consume clicks on the backdrop so they cannot reach the UI underneath.
 	state.backdrop.Clicked(gtx)
@@ -2190,12 +2225,22 @@ func layoutDeviceAuth(gtx layout.Context, theme *material.Theme, state *deviceAu
 		return layout.Dimensions{}
 	}
 	if state.openButton.Clicked(gtx) && state.verificationURI != "" {
-		browser.OpenURL(state.verificationURI)
+		if err := openExternalURL(state.verificationURI); err != nil {
+			state.openErr = "Could not open a browser automatically. Use Copy link and open it manually."
+		} else {
+			state.openErr = ""
+		}
 	}
 	if state.copyButton.Clicked(gtx) && state.userCode != "" {
 		gtx.Execute(clipboard.WriteCmd{
 			Type: "text/plain",
 			Data: io.NopCloser(strings.NewReader(state.userCode)),
+		})
+	}
+	if state.copyLinkButton.Clicked(gtx) && state.verificationURI != "" {
+		gtx.Execute(clipboard.WriteCmd{
+			Type: "text/plain",
+			Data: io.NopCloser(strings.NewReader(state.verificationURI)),
 		})
 	}
 	if !state.open {
@@ -2647,16 +2692,30 @@ func layoutDeviceAuthContent(gtx layout.Context, theme *material.Theme, state *d
 			}),
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layoutFlow(gtx, unit.Dp(8), unit.Dp(8),
+					func(gtx layout.Context) layout.Dimensions {
 						return material.Button(theme, &state.openButton, "Open Twitch").Layout(gtx)
-					}),
-					layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					},
+					func(gtx layout.Context) layout.Dimensions {
 						return material.Button(theme, &state.copyButton, "Copy code").Layout(gtx)
-					}),
+					},
+					func(gtx layout.Context) layout.Dimensions {
+						return material.Button(theme, &state.copyLinkButton, "Copy link").Layout(gtx)
+					},
 				)
 			}),
+		)
+		if state.openErr != "" {
+			children = append(children,
+				layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					label := material.Body2(theme, state.openErr)
+					label.Color = color.NRGBA{R: 0xff, G: 0xc0, B: 0x70, A: 0xff}
+					return label.Layout(gtx)
+				}),
+			)
+		}
+		children = append(children,
 			layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				status := "Waiting for authorization..."
@@ -2772,6 +2831,7 @@ func run(window *app.Window) error {
 		deviceAuth.userCode = ""
 		deviceAuth.verificationURI = ""
 		deviceAuth.errText = ""
+		deviceAuth.openErr = ""
 		deviceAuth.events, deviceAuth.cancel = startDeviceAuth(window, deviceClientID, hasherino.TwitchOAuthScopes)
 	}
 	usersMenu.onRemove = func(index int) {

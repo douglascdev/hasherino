@@ -18,6 +18,13 @@
             gcc
             pkg-config
             sqlite
+
+            # Flatpak packaging
+            flatpak
+            flatpak-builder
+            ostree
+            appstream
+            desktop-file-utils
           ];
 
           buildInputs = with pkgs; [

@@ -1,0 +1,42 @@
+app-id: com.hashysoftware.hasherino
+branch: master
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.golang
+command: hasherino
+
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  - --talk-name=org.freedesktop.portal.Desktop
+
+modules:
+  - name: hasherino
+    buildsystem: simple
+    build-options:
+      # The Go module cache is populated during the build.
+      build-args:
+        - --share=network
+      prepend-path: /usr/lib/sdk/golang/bin
+      env:
+        CGO_ENABLED: '1'
+        GOROOT: /usr/lib/sdk/golang
+        GOTOOLCHAIN: local
+    build-commands:
+      - 'go build -trimpath -buildvcs=false -ldflags="-s -w" -o hasherino-app main.go'
+      - install -Dm755 hasherino-app /app/bin/hasherino
+      - install -Dm644 flatpak/com.hashysoftware.hasherino.desktop /app/share/applications/com.hashysoftware.hasherino.desktop
+      - install -Dm644 flatpak/com.hashysoftware.hasherino.metainfo.xml /app/share/metainfo/com.hashysoftware.hasherino.metainfo.xml
+      - install -Dm644 flatpak/com.hashysoftware.hasherino.svg /app/share/icons/hicolor/scalable/apps/com.hashysoftware.hasherino.svg
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - .git
+          - .flatpak-builder
+          - '*.flatpak'
