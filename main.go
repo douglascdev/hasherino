@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,6 +25,9 @@ import (
 	"unicode"
 
 	"gioui.org/app"
+	giofont "gioui.org/font"
+	"gioui.org/font/gofont"
+	"gioui.org/font/opentype"
 	"gioui.org/io/clipboard"
 	"gioui.org/io/event"
 	"gioui.org/io/key"
@@ -3134,8 +3138,87 @@ func main() {
 	app.Main()
 }
 
-func run(window *app.Window) error {
+// newAppTheme builds the material theme with an emoji-capable text shaper.
+// Platform font fallback does not reliably expose emoji fonts to Gio, so load
+// the system emoji font explicitly and add it to the font collection. The Go
+// fonts come first so normal text and digits do not fall through to the emoji
+// font, which also contains glyphs for digits used by keycap sequences.
+func newAppTheme() *material.Theme {
 	theme := material.NewTheme()
+	collection := gofont.Collection()
+	if emoji, ok := loadEmojiFontFace(); ok {
+		collection = append(collection, emoji)
+	}
+	theme.Shaper = giotext.NewShaper(giotext.WithCollection(collection))
+	return theme
+}
+
+func loadEmojiFontFace() (giotext.FontFace, bool) {
+	for _, path := range emojiFontCandidates() {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		face, err := opentype.Parse(data)
+		if err != nil {
+			continue
+		}
+		return giotext.FontFace{
+			Font: giofont.Font{Typeface: "Emoji"},
+			Face: face,
+		}, true
+	}
+	return giotext.FontFace{}, false
+}
+
+func emojiFontCandidates() []string {
+	paths := []string{
+		// Android
+		"/system/fonts/NotoColorEmoji.ttf",
+		"/system/fonts/NotoColorEmoji-Regular.ttf",
+		"/system/fonts/NotoEmoji-Regular.ttf",
+		"/system/fonts/AndroidEmoji.ttf",
+		"/system/fonts/Emoji.ttf",
+		// Windows
+		`C:\Windows\Fonts\seguiemj.ttf`,
+		`C:\Windows\Fonts\SegoeUIEmoji.ttf`,
+		`C:\Windows\Fonts\NotoColorEmoji.ttf`,
+		// Linux, including the Flatpak runtime
+		"/usr/share/fonts/noto/NotoColorEmoji.ttf",
+		"/usr/share/fonts/noto-emoji/NotoColorEmoji.ttf",
+		"/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+		"/usr/share/fonts/truetype/noto-color-emoji/NotoColorEmoji.ttf",
+		"/usr/share/fonts/TTF/NotoColorEmoji.ttf",
+		"/usr/share/fonts/emoji/NotoColorEmoji.ttf",
+		"/usr/share/fonts/noto/NotoEmoji-Regular.ttf",
+		"/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+	}
+	if runtime.GOOS == "linux" {
+		if path := findEmojiFontWithFontconfig(); path != "" {
+			paths = append([]string{path}, paths...)
+		}
+	}
+	return paths
+}
+
+// findEmojiFontWithFontconfig resolves the Nix store and custom font paths
+// that cannot be guessed from the usual /usr/share/fonts locations.
+func findEmojiFontWithFontconfig() string {
+	for _, family := range []string{"Noto Color Emoji", "Noto Emoji", "emoji"} {
+		out, err := exec.Command("fc-match", "-f", "%{file}", family).Output()
+		if err != nil {
+			continue
+		}
+		path := strings.TrimSpace(string(out))
+		if path != "" && strings.Contains(strings.ToLower(path), "emoji") {
+			return path
+		}
+	}
+	return ""
+}
+
+func run(window *app.Window) error {
+	theme := newAppTheme()
 	theme.Palette = material.Palette{
 		Bg:         color.NRGBA{R: 0x12, G: 0x12, B: 0x12, A: 0xff},
 		Fg:         color.NRGBA{R: 0xe6, G: 0xe6, B: 0xe6, A: 0xff},
