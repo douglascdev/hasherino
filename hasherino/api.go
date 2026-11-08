@@ -9,11 +9,13 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pkg/browser"
@@ -168,6 +170,47 @@ var (
 	ErrDeviceCodeExpired          = errors.New("expired_token")
 )
 
+// isTransientDeviceAuthError reports whether a device authorization request
+// failed for a reason that is likely to resolve on its own, such as the device
+// momentarily losing network access while it is backgrounded.
+func isTransientDeviceAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	for _, target := range []error{
+		syscall.ECONNREFUSED,
+		syscall.ECONNRESET,
+		syscall.EHOSTUNREACH,
+		syscall.ENETUNREACH,
+		syscall.EPIPE,
+	} {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	var oauthErr *twitchOAuthError
+	if errors.As(err, &oauthErr) {
+		return oauthErr.Status >= http.StatusInternalServerError ||
+			oauthErr.Status == http.StatusTooManyRequests
+	}
+	return false
+}
+
 // DeviceAuthorization is the response from Twitch's device authorization
 // endpoint. The user enters UserCode at VerificationURI while the client polls
 // for a token with DeviceCode.
@@ -215,14 +258,26 @@ func (t *TwitchOAuth) StartDeviceAuth(ctx context.Context, clientID, scopes stri
 	form.Set("client_id", clientID)
 	form.Set("scopes", scopes)
 
-	var authorization DeviceAuthorization
-	if err := t.postOAuthForm(ctx, "https://id.twitch.tv/oauth2/device", form, &authorization); err != nil {
-		return nil, err
+	for {
+		var authorization DeviceAuthorization
+		err := t.postOAuthForm(ctx, "https://id.twitch.tv/oauth2/device", form, &authorization)
+		if err == nil {
+			if authorization.DeviceCode == "" || authorization.UserCode == "" {
+				return nil, errors.New("twitch oauth: device authorization response is missing a code")
+			}
+			return &authorization, nil
+		}
+		if !isTransientDeviceAuthError(err) {
+			return nil, err
+		}
+		// A mobile app can lose network briefly when it is backgrounded.
+		// Retry while the dialog is open instead of failing the whole flow.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
 	}
-	if authorization.DeviceCode == "" || authorization.UserCode == "" {
-		return nil, errors.New("twitch oauth: device authorization response is missing a code")
-	}
-	return &authorization, nil
 }
 
 // CheckDeviceAuth performs one token poll. It returns
@@ -263,6 +318,9 @@ func (t *TwitchOAuth) WaitForDeviceAuth(ctx context.Context, clientID, scopes, d
 			case errors.Is(err, ErrDeviceAuthorizationPending):
 			case errors.Is(err, ErrDeviceSlowDown):
 				interval += 5 * time.Second
+			case isTransientDeviceAuthError(err):
+				// Keep polling. Mobile apps can lose DNS or network briefly
+				// when they are backgrounded; the device code is still valid.
 			default:
 				return nil, err
 			}

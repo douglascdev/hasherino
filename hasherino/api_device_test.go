@@ -4,11 +4,41 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
 )
+
+func TestIsTransientDeviceAuthError(t *testing.T) {
+	dnsErr := &net.DNSError{
+		Err:        "no such host",
+		Name:       "id.twitch.tv",
+		IsNotFound: true,
+	}
+	if !isTransientDeviceAuthError(&url.Error{
+		Op:  "Post",
+		URL: "https://id.twitch.tv/oauth2/token",
+		Err: dnsErr,
+	}) {
+		t.Error("expected DNS errors to be transient")
+	}
+	if isTransientDeviceAuthError(ErrDeviceAccessDenied) {
+		t.Error("did not expect access denied to be transient")
+	}
+	if isTransientDeviceAuthError(&twitchOAuthError{
+		Status:  http.StatusBadRequest,
+		Message: "invalid request",
+	}) {
+		t.Error("did not expect a 400 response to be transient")
+	}
+	if !isTransientDeviceAuthError(&twitchOAuthError{
+		Status: http.StatusBadGateway,
+	}) {
+		t.Error("expected a 502 response to be transient")
+	}
+}
 
 func TestPostOAuthFormSendsDeviceFields(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
