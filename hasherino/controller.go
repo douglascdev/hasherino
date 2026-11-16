@@ -33,6 +33,10 @@ type HasherinoController struct {
 	// an account are only loaded once per run
 	userEmotesLock     sync.Mutex
 	userEmotesLoadedId string
+	// emoteRefreshHook is notified when a refreshed emote list reports new or
+	// changed emotes, so the image cache can update its files.
+	emoteRefreshLock sync.RWMutex
+	emoteRefreshHook func([]*Emote)
 }
 
 const defaultClientID = "hvmj7blkwy2gw3xf820n47i85g4sub"
@@ -70,7 +74,7 @@ func (hc *HasherinoController) NewWithClientID(callbackMap map[string]func(ChatM
 	if err != nil {
 		return nil, err
 	}
-	permDB.AutoMigrate(&Account{}, &Tab{}, &AppSettings{})
+	permDB.AutoMigrate(&Account{}, &Tab{}, &AppSettings{}, &CachedEmote{})
 
 	c := &HasherinoController{
 		appId:       clientID,
@@ -122,6 +126,7 @@ func (hc *HasherinoController) NewWithClientID(callbackMap map[string]func(ChatM
 			log.Println("Failed to save default settings:", err)
 		}
 	}
+	c.hydrateEmoteCatalog()
 	go c.twitchOAuth.ListenForOAuthRedirect(c)
 	return c, nil
 }
@@ -206,7 +211,7 @@ func (hc *HasherinoController) RemoveAccount(id string) error {
 		if result.Error != nil {
 			return result.Error
 		}
-		return nil
+		return tx.Where("owner_id = ?", id).Delete(&CachedEmote{}).Error
 	})
 }
 
@@ -246,6 +251,9 @@ func (hc *HasherinoController) SetActiveAccount(id string) error {
 		return err
 	}
 
+	// make the emotes of the newly active account available right away
+	hc.hydrateEmoteCatalog()
+
 	hc.writeWS.Close()
 	go func() {
 		if err := hc.Listen(); err != nil {
@@ -277,6 +285,7 @@ func (hc *HasherinoController) OpenOAuthPage() {
 func (hc *HasherinoController) AddTab(channel string) error {
 	channel = strings.ToLower(strings.TrimSpace(channel))
 
+	channelId := ""
 	err := hc.permDB.Transaction(func(tx *gorm.DB) error {
 		_, exists := hc.readWS.channels[channel]
 		if exists {
@@ -314,14 +323,16 @@ func (hc *HasherinoController) AddTab(channel string) error {
 			return errors.New("failed to join channel " + login)
 		}
 
-		err = hc.AddTempTabs(&[]string{users.Data[0].ID})
-		if err != nil {
-			return err
-		}
-
+		channelId = users.Data[0].ID
 		return nil
 	})
-	return err
+	if err != nil {
+		return err
+	}
+
+	// load the emotes after the tab transaction committed, so saving the
+	// emote catalog cannot contend with its write lock
+	return hc.AddTempTabs(&[]string{channelId})
 }
 
 type EmojiJsonMap map[string]struct {
@@ -360,13 +371,12 @@ func GetEmojiJSONMap() (*EmojiJsonMap, error) {
 
 func (hc *HasherinoController) AddTempTabs(channelIds *[]string) error {
 	go func(channelIds *[]string) {
-		emoteObjs := []Emote{}
-
 		globalEmotes, err, isCached := STVGetGlobalEmotes()
 		if !isCached {
 			if err != nil {
 				log.Printf("Failed to load global 7tv emotes: %s", err)
 			} else {
+				emoteObjs := []Emote{}
 				for _, emote := range globalEmotes.Data.EmoteSet.Emotes {
 					width, height := emote.Data.Dimensions()
 					emoteObjs = append(emoteObjs, Emote{
@@ -376,12 +386,20 @@ func (hc *HasherinoController) AddTempTabs(channelIds *[]string) error {
 						Animated:  emote.Data.Animated,
 						Width:     width,
 						Height:    height,
+						Version:   emote.Data.Version(),
 						ChannelID: nil,
 						OwnerID:   "",
 						Owner:     nil,
 					})
 				}
 				log.Println("Loaded " + strconv.Itoa(len(emoteObjs)) + " 7tv global emotes")
+				if len(emoteObjs) == 0 {
+					// an empty global set is almost certainly a broken
+					// response; keep the cached emotes instead of wiping them
+					log.Println("7tv returned no global emotes; keeping the cached ones")
+				} else if err := hc.replaceEmotes(emoteScope{source: SevenTV}, emoteObjs); err != nil {
+					log.Printf("Failed to save 7tv global emotes: %s", err)
+				}
 			}
 		}
 
@@ -409,40 +427,37 @@ func (hc *HasherinoController) AddTempTabs(channelIds *[]string) error {
 				continue
 			}
 
+			if len(stvUser.Data.UserByConnection.EmoteSets) == 0 {
+				// no sets means the connection is unknown, not that the
+				// channel has no emotes; keep the cached ones
+				continue
+			}
+
 			channelEmotes := []Emote{}
-			if len(stvUser.Data.UserByConnection.EmoteSets) > 0 {
-				emoteSet, err := stvUser.DefaultEmoteSet()
-				if err != nil {
-					log.Printf("Failed to load default 7tv emote set: %s", err)
-					continue
-				}
-				for _, emote := range emoteSet.Emotes {
-					width, height := emote.Data.Dimensions()
-					channelEmotes = append(channelEmotes, Emote{
-						Id:        emote.Data.ID,
-						Source:    SevenTV,
-						Name:      emote.Name,
-						Animated:  emote.Data.Animated,
-						Width:     width,
-						Height:    height,
-						ChannelID: &channelId,
-						OwnerID:   "",
-						Owner:     nil,
-					})
-				}
+			emoteSet, err := stvUser.DefaultEmoteSet()
+			if err != nil {
+				log.Printf("Failed to load default 7tv emote set: %s", err)
+				continue
+			}
+			for _, emote := range emoteSet.Emotes {
+				width, height := emote.Data.Dimensions()
+				channelEmotes = append(channelEmotes, Emote{
+					Id:        emote.Data.ID,
+					Source:    SevenTV,
+					Name:      emote.Name,
+					Animated:  emote.Data.Animated,
+					Width:     width,
+					Height:    height,
+					Version:   emote.Data.Version(),
+					ChannelID: &channelId,
+					OwnerID:   "",
+					Owner:     nil,
+				})
 			}
 			log.Println("Loaded " + strconv.Itoa(len(channelEmotes)) + " 7tv user emotes for " + channelId)
-			emoteObjs = append(emoteObjs, channelEmotes...)
-		}
-
-		if len(emoteObjs) == 0 {
-			return
-		}
-		err = hc.memDB.Transaction(func(tx *gorm.DB) error {
-			return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&emoteObjs).Error
-		})
-		if err != nil {
-			log.Printf("Failed to save 7tv emotes: %s", err)
+			if err := hc.replaceEmotes(emoteScope{source: SevenTV, channelID: &channelId}, channelEmotes); err != nil {
+				log.Printf("Failed to save 7tv user emotes for %s: %s", channelId, err)
+			}
 		}
 	}(channelIds)
 
@@ -462,6 +477,179 @@ func (hc *HasherinoController) AddTempTabs(channelIds *[]string) error {
 	})
 
 	return err
+}
+
+// SetEmoteRefreshHook sets the function notified when a refreshed emote list
+// adds, changes or removes emotes. It is called once per refreshed list, from
+// background goroutines.
+func (hc *HasherinoController) SetEmoteRefreshHook(hook func([]*Emote)) {
+	hc.emoteRefreshLock.Lock()
+	defer hc.emoteRefreshLock.Unlock()
+	hc.emoteRefreshHook = hook
+}
+
+func (hc *HasherinoController) notifyEmotesChanged(emotes []Emote) {
+	hc.emoteRefreshLock.RLock()
+	hook := hc.emoteRefreshHook
+	hc.emoteRefreshLock.RUnlock()
+	if hook == nil || len(emotes) == 0 {
+		return
+	}
+	copied := make([]*Emote, len(emotes))
+	for i := range emotes {
+		emote := emotes[i]
+		copied[i] = &emote
+	}
+	hook(copied)
+}
+
+// emoteScope selects one emote list: the source of the emotes, their owner
+// and the channel they belong to. An empty channelID selects the emotes that
+// are not bound to a channel, like global 7tv emotes.
+type emoteScope struct {
+	source    EmoteSourceEnum
+	ownerID   string
+	channelID *string
+}
+
+func (s emoteScope) query(tx *gorm.DB) *gorm.DB {
+	result := tx.Where("source = ? AND owner_id = ?", s.source, s.ownerID)
+	if s.channelID == nil {
+		return result.Where("channel_id IS NULL")
+	}
+	return result.Where("channel_id = ?", *s.channelID)
+}
+
+// replaceEmotes replaces every emote in scope with emotes. The persisted
+// catalog is updated as well, and the refresh hook is notified about the
+// emotes that were added, changed or removed. Replacing instead of inserting
+// keeps renamed, modified and deleted emotes in sync with their list.
+func (hc *HasherinoController) replaceEmotes(scope emoteScope, emotes []Emote) error {
+	// 7tv sets can list the same emote more than once, for example under
+	// several aliases; keep every alias but drop exact duplicate entries
+	emotes = dedupeEmotes(emotes)
+
+	previous := []Emote{}
+	if err := scope.query(hc.memDB).Find(&previous).Error; err != nil {
+		return err
+	}
+	previousByIdentity := make(map[string]*Emote, len(previous))
+	for i := range previous {
+		previousByIdentity[previous[i].identity()] = &previous[i]
+	}
+	current := make(map[string]struct{}, len(emotes))
+	notify := []Emote{}
+	for i := range emotes {
+		identity := emotes[i].identity()
+		current[identity] = struct{}{}
+		// a new emote has no cached content to invalidate, so only changes
+		// and removals are reported
+		if old, ok := previousByIdentity[identity]; ok && !sameEmote(old, &emotes[i]) {
+			notify = append(notify, emotes[i])
+		}
+	}
+	for i := range previous {
+		if _, ok := current[previous[i].identity()]; !ok {
+			notify = append(notify, previous[i])
+		}
+	}
+
+	err := hc.memDB.Transaction(func(tx *gorm.DB) error {
+		if err := scope.query(tx).Delete(&Emote{}).Error; err != nil {
+			return err
+		}
+		if len(emotes) == 0 {
+			return nil
+		}
+		// DoNothing keeps two concurrent refreshes of the same list from
+		// failing with a unique constraint error
+		return tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(&emotes, 500).Error
+	})
+	if err != nil {
+		return err
+	}
+
+	cached := make([]CachedEmote, len(emotes))
+	for i := range emotes {
+		cached[i] = cachedEmote(&emotes[i])
+	}
+	err = hc.permDB.Transaction(func(tx *gorm.DB) error {
+		if err := scope.query(tx).Delete(&CachedEmote{}).Error; err != nil {
+			return err
+		}
+		if len(cached) == 0 {
+			return nil
+		}
+		return tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(&cached, 500).Error
+	})
+	if err != nil {
+		// the in-memory list is already usable; the catalog catches up the
+		// next time the list is refreshed
+		log.Printf("Failed to update the cached emote catalog: %s", err)
+	}
+
+	hc.notifyEmotesChanged(notify)
+	return nil
+}
+
+// dedupeEmotes drops exact duplicate entries, which a list can contain
+// after a malformed or overlapping response.
+func dedupeEmotes(emotes []Emote) []Emote {
+	seen := make(map[string]struct{}, len(emotes))
+	result := make([]Emote, 0, len(emotes))
+	for i := range emotes {
+		identity := emotes[i].identity()
+		if _, ok := seen[identity]; ok {
+			continue
+		}
+		seen[identity] = struct{}{}
+		result = append(result, emotes[i])
+	}
+	return result
+}
+
+// sameEmote reports whether a refreshed emote still describes the same
+// emote, so its cached file and rendering do not need to be updated.
+func sameEmote(a, b *Emote) bool {
+	return a.Name == b.Name &&
+		a.Animated == b.Animated &&
+		a.Width == b.Width &&
+		a.Height == b.Height &&
+		a.Version == b.Version
+}
+
+// hydrateEmoteCatalog fills the in-memory emote database with the persisted
+// catalog of the active account, so chats can render cached emotes before
+// the emote lists are fetched again.
+func (hc *HasherinoController) hydrateEmoteCatalog() {
+	owner := ""
+	if account, err := hc.GetActiveAccount(); err == nil {
+		owner = account.Id
+	}
+
+	cached := []CachedEmote{}
+	query := hc.permDB.Where("owner_id = ?", "")
+	if owner != "" {
+		query = hc.permDB.Where("owner_id = ? OR owner_id = ?", owner, "")
+	}
+	if err := query.Find(&cached).Error; err != nil {
+		log.Printf("Failed to load the cached emote catalog: %s", err)
+		return
+	}
+	if len(cached) == 0 {
+		return
+	}
+
+	emotes := make([]Emote, len(cached))
+	for i := range cached {
+		emotes[i] = cached[i].emote()
+	}
+	err := hc.memDB.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(&emotes, 500).Error
+	if err != nil {
+		log.Printf("Failed to hydrate the cached emotes: %s", err)
+		return
+	}
+	log.Println("Loaded " + strconv.Itoa(len(emotes)) + " cached emotes")
 }
 
 // GetEmotes returns every emote matching the search for the selected tab.
@@ -609,6 +797,14 @@ func (hc *HasherinoController) RemoveTab(id string) error {
 			return result.Error
 		}
 
+		// the emotes of the channel are no longer needed
+		if result = hc.memDB.Where("channel_id = ?", id).Delete(&Emote{}); result.Error != nil {
+			return result.Error
+		}
+		if result = tx.Where("channel_id = ?", id).Delete(&CachedEmote{}); result.Error != nil {
+			return result.Error
+		}
+
 		err := hc.readWS.Part(tab.Login)
 		if err != nil {
 			return errors.New("failed to part channel" + tab.Login)
@@ -698,23 +894,21 @@ func (hc *HasherinoController) loadUserEmotes(account *Account) {
 		})
 	}
 
-	err = hc.memDB.Transaction(func(tx *gorm.DB) error {
-		// the account is the owner of its emotes, so they need a chat user
-		// row to reference
-		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&ChatUser{
-			Id:          account.Id,
-			Login:       account.Login,
-			DisplayName: account.DisplayName,
-		})
-		if result.Error != nil {
-			return result.Error
-		}
-		if len(emoteObjs) == 0 {
-			return nil
-		}
-		return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&emoteObjs).Error
-	})
+	// the account is the owner of its emotes, so they need a chat user row
+	// to reference
+	err = hc.memDB.Clauses(clause.OnConflict{DoNothing: true}).Create(&ChatUser{
+		Id:          account.Id,
+		Login:       account.Login,
+		DisplayName: account.DisplayName,
+	}).Error
 	if err != nil {
+		log.Printf("Failed to save the chat user of %s: %s", account.Login, err)
+		return
+	}
+
+	// the twitch cdn version of the emote is not known, so the image cache
+	// revalidates its files with the http validators of the cdn
+	if err := hc.replaceEmotes(emoteScope{source: Twitch, ownerID: account.Id}, emoteObjs); err != nil {
 		log.Printf("Failed to save twitch user emotes: %s", err)
 		return
 	}
@@ -805,4 +999,22 @@ func GetDataFolder() (string, error) {
 		return "", err
 	}
 	return path.Join(dir, "hasherino"), nil
+}
+
+// GetCacheFolder returns the folder for disposable cached data, like the
+// downloaded emote files. It lives in the user's cache directory, so the data
+// can be deleted at any time and is not part of configuration backups or
+// roaming profiles.
+func GetCacheFolder() (string, error) {
+	if dir := os.Getenv("HASHERINO_CACHE_DIR"); dir != "" {
+		return dir, nil
+	}
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		// some environments, like minimal CI containers, have no cache
+		// directory; fall back to the data folder instead of disabling the
+		// cache
+		return GetDataFolder()
+	}
+	return filepath.Join(dir, "hasherino"), nil
 }

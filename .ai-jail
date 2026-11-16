@@ -3,4 +3,3 @@
 # Edit freely. Regenerate with: ai-jail --clean --init
 
 command = ["opencode"]
-no_toolchains = false

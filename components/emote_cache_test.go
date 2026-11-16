@@ -7,6 +7,8 @@ import (
 	"image/color/palette"
 	"image/gif"
 	"image/png"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -75,6 +77,36 @@ func pngBytes(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
+}
+
+func TestEmoteCacheKeyIncludesVersion(t *testing.T) {
+	emote := &hasherino.Emote{Id: "id", Source: hasherino.SevenTV, Version: "v1", Animated: true}
+	if got, want := emoteCacheKey(emote), "1-id-v1.gif"; got != want {
+		t.Errorf("unexpected key: got %q, want %q", got, want)
+	}
+	emote.Version = "v2"
+	if got, want := emoteCacheKey(emote), "1-id-v2.gif"; got != want {
+		t.Errorf("expected a new version to use a new file: got %q, want %q", got, want)
+	}
+}
+
+func TestCleanEmoteCacheKeepsFreshTemporaryFiles(t *testing.T) {
+	dir := t.TempDir()
+	tmp := filepath.Join(dir, "tmp-in-progress")
+	if err := os.WriteFile(tmp, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cleanEmoteCache(dir)
+	if _, err := os.Stat(tmp); err != nil {
+		t.Errorf("expected a temporary file of a write in progress to be kept: %s", err)
+	}
+
+	stale := time.Now().Add(-2 * time.Hour)
+	os.Chtimes(tmp, stale, stale)
+	cleanEmoteCache(dir)
+	if _, err := os.Stat(tmp); !errors.Is(err, os.ErrNotExist) {
+		t.Error("expected an old temporary file to be removed")
+	}
 }
 
 func TestEmoteCacheDecodesStillEmotesByFileFormat(t *testing.T) {

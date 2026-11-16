@@ -3,6 +3,8 @@ package hasherino
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -726,6 +728,24 @@ func (d *STVEmoteData) Dimensions() (width int, height int) {
 		}
 	}
 	return width, height
+}
+
+// Version returns a fingerprint of the files of the emote. It changes when
+// the emote is re-encoded or its dimensions change, so the image cache can
+// drop the old file instead of serving it forever. 7tv does not put a version
+// in its cdn urls, so the version is derived from the emote data.
+func (d *STVEmoteData) Version() string {
+	width, height := d.Dimensions()
+	hash := sha256.New()
+	fmt.Fprintf(hash, "%t:%d:%d", d.Animated, width, height)
+	files := slices.Clone(d.Host.Files)
+	slices.SortFunc(files, func(a, b STVFile) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	for _, file := range files {
+		fmt.Fprintf(hash, "|%s:%d:%d", file.Name, file.Width, file.Height)
+	}
+	return hex.EncodeToString(hash.Sum(nil))[:16]
 }
 
 // EmoteSetEmote is one entry of a 7tv emote set.

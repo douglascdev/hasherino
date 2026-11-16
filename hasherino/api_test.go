@@ -147,3 +147,31 @@ func TestSTVEmoteDataDimensions(t *testing.T) {
 		})
 	}
 }
+
+func TestSTVEmoteDataVersion(t *testing.T) {
+	parse := func(files string) *STVEmoteData {
+		t.Helper()
+		var data STVEmoteData
+		if err := json.Unmarshal([]byte(`{"id":"e","name":"e","animated":true,"host":{"url":"//cdn","files":`+files+`}}`), &data); err != nil {
+			t.Fatal(err)
+		}
+		return &data
+	}
+
+	files := `[{"name":"1x.webp","width":32,"height":32},{"name":"2x.webp","width":64,"height":64}]`
+	version := parse(files).Version()
+	if version == "" {
+		t.Fatal("expected a version")
+	}
+	if reordered := parse(`[{"name":"2x.webp","width":64,"height":64},{"name":"1x.webp","width":32,"height":32}]`); reordered.Version() != version {
+		t.Error("expected the file order not to change the version")
+	}
+	if resized := parse(`[{"name":"1x.webp","width":48,"height":48}]`); resized.Version() == version {
+		t.Error("expected a resized emote to change the version")
+	}
+	still := parse(files)
+	still.Animated = false
+	if still.Version() == version {
+		t.Error("expected the animated flag to change the version")
+	}
+}

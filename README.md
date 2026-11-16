@@ -3,6 +3,23 @@
 A Twitch chat client with support for Twitch and 7TV emotes, user badges, chat
 history, and a mobile-friendly settings dialog.
 
+## Emote cache
+
+Downloaded emote files are kept in the platform's cache directory, so emotes
+render immediately on the next start:
+
+| Platform | Location |
+| --- | --- |
+| Linux | `$XDG_CACHE_HOME/hasherino/emote-cache` or `~/.cache/hasherino/emote-cache` |
+| macOS | `~/Library/Caches/hasherino/emote-cache` |
+| Windows | `%LocalAppData%\hasherino\emote-cache` |
+| Flatpak | `~/.var/app/com.hashysoftware.hasherino/cache/hasherino/emote-cache` |
+
+The cache is disposable; deleting it is always safe. Files that have not been
+used for 30 days are removed, and the cache is capped at 512 MiB. Cached files
+are revalidated in the background when their emote list loads. Set
+`HASHERINO_CACHE_DIR` to use a different folder.
+
 ## Install with Flatpak
 
 ### From a prebuilt bundle

@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,7 +23,7 @@ import (
 )
 
 const (
-	// emoteCacheFolder is the folder inside the app data folder that stores
+	// emoteCacheFolder is the folder inside the app cache folder that stores
 	// downloaded emote files, so emotes are only ever downloaded once.
 	emoteCacheFolder = "emote-cache"
 	// emoteCacheMaxAge is how long unused emote files are kept on disk
@@ -33,7 +35,15 @@ const (
 	// the same time, so bursts of many distinct emotes don't saturate the
 	// connection.
 	emoteMaxParallelDownloads = 8
+	// emoteCacheTouchInterval throttles refreshing the modification time of
+	// a cached file, which the cleanup uses as its last use.
+	emoteCacheTouchInterval = time.Hour
 )
+
+// emoteCacheMaxBytes is how many bytes of emote files are kept on disk. The
+// least recently used files are removed once it is exceeded. It is a
+// variable so that tests can lower it.
+var emoteCacheMaxBytes int64 = 512 << 20
 
 // emoteMemoryLimit is how many bytes of decoded emotes are kept in memory.
 // Decoded emotes are shared by every widget showing them, and the least
@@ -125,27 +135,70 @@ func getEmoteCache() *emoteCache {
 }
 
 func emoteCacheDir() (string, error) {
-	dataFolder, err := hasherino.GetDataFolder()
+	cacheFolder, err := hasherino.GetCacheFolder()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dataFolder, emoteCacheFolder), nil
+	return filepath.Join(cacheFolder, emoteCacheFolder), nil
 }
 
-// cleanEmoteCache removes emote files that have not been used for a long time.
+// cleanEmoteCache removes emote files that have not been used for a long time
+// and the least recently used ones above emoteCacheMaxBytes.
 func cleanEmoteCache(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
+
+	type cachedFile struct {
+		name string
+		size int64
+		mod  time.Time
+	}
+	files := make([]cachedFile, 0, len(entries))
 	stale := time.Now().Add(-emoteCacheMaxAge)
+	var total int64
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
+		name := entry.Name()
+		// index.json and tmp-* belong to the persistent emote cache that
+		// shares this folder
+		if name == "index.json" {
+			continue
+		}
+		path := filepath.Join(dir, name)
 		info, err := entry.Info()
-		if err == nil && info.ModTime().Before(stale) {
-			os.Remove(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		if strings.HasPrefix(name, "tmp-") {
+			// only remove the leftovers of interrupted writes; a fresh
+			// temporary file belongs to a write in progress
+			if info.ModTime().Before(time.Now().Add(-time.Hour)) {
+				os.Remove(path)
+			}
+			continue
+		}
+		if info.ModTime().Before(stale) {
+			os.Remove(path)
+			continue
+		}
+		files = append(files, cachedFile{name: name, size: info.Size(), mod: info.ModTime()})
+		total += info.Size()
+	}
+
+	if emoteCacheMaxBytes <= 0 || total <= emoteCacheMaxBytes {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+	for _, file := range files {
+		if total <= emoteCacheMaxBytes {
+			break
+		}
+		if os.Remove(filepath.Join(dir, file.name)) == nil {
+			total -= file.size
 		}
 	}
 }
@@ -272,7 +325,9 @@ func isPng(data []byte) bool {
 // disk cache. Files missing from disk are downloaded and stored there.
 func (c *emoteCache) emoteFile(emote *hasherino.Emote) ([]byte, bool, error) {
 	if c.dir != "" {
-		if data, err := os.ReadFile(c.path(emote)); err == nil && len(data) > 0 {
+		path := c.path(emote)
+		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+			touchEmoteFile(path)
 			return data, true, nil
 		}
 	}
@@ -290,17 +345,37 @@ func (c *emoteCache) emoteFile(emote *hasherino.Emote) ([]byte, bool, error) {
 	return data, false, nil
 }
 
+// touchEmoteFile refreshes the modification time of a cached file, which the
+// cleanup uses as its last use. Reading a file does not reliably update its
+// access time, so this keeps frequently used emotes from being cleaned up.
+func touchEmoteFile(path string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	if now.Sub(info.ModTime()) < emoteCacheTouchInterval {
+		return
+	}
+	os.Chtimes(path, now, now)
+}
+
 func (c *emoteCache) path(emote *hasherino.Emote) string {
 	return filepath.Join(c.dir, emoteCacheKey(emote))
 }
 
-// emoteCacheKey identifies the file of the emote on disk.
+// emoteCacheKey identifies the file of the emote on disk. The version keeps a
+// changed emote from reading the file of its previous content.
 func emoteCacheKey(emote *hasherino.Emote) string {
 	extension := emote.GetUrlExtension()
 	if extension == "" {
 		extension = ".img"
 	}
-	return strconv.FormatInt(int64(emote.Source), 10) + "-" + emote.Id + extension
+	key := strconv.FormatInt(int64(emote.Source), 10) + "-" + emote.Id
+	if emote.Version != "" {
+		key += "-" + emote.Version
+	}
+	return key + extension
 }
 
 // writeEmoteFile writes the file atomically, so that concurrent readers never

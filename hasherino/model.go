@@ -2,6 +2,7 @@ package hasherino
 
 import (
 	"errors"
+	"strconv"
 
 	"gorm.io/gorm"
 )
@@ -86,15 +87,105 @@ func (c *ChatUserTempTab) AfterDelete(tx *gorm.DB) (err error) {
 }
 
 type Emote struct {
-	Id        string          `gorm:"primaryKey"`
-	Source    EmoteSourceEnum `gorm:"primaryKey"`
-	Name      string
+	Id     string          `gorm:"primaryKey"`
+	Source EmoteSourceEnum `gorm:"primaryKey"`
+	Name   string          `gorm:"primaryKey"` // aliases of one emote are separate rows
+
 	Animated  bool
 	Width     int       // intrinsic width of the emote from its CDN, 0 when unknown
 	Height    int       // intrinsic height of the emote from its CDN, 0 when unknown
+	Version   string    // identifies the content of the emote's file, empty when unknown
 	ChannelID *string   `gorm:"primaryKey"`                       // if a channel is set, only renders in that channel
 	OwnerID   string    `gorm:"primaryKey;index"`                 // Foreign key field
 	Owner     *ChatUser `gorm:"foreignKey:OwnerID;references:Id"` // if an owner is set, only renders when the message sender is the owner
+
+	// DedupeKey is a non-null identity for the emote. The composite primary
+	// key contains a nullable ChannelID, and SQLite treats NULLs as distinct,
+	// so without it cached emotes could be hydrated more than once.
+	DedupeKey string `gorm:"uniqueIndex"`
+}
+
+// BeforeCreate fills the DedupeKey of emotes that were not built by the
+// controller, like the ones created by tests.
+func (e *Emote) BeforeCreate(tx *gorm.DB) error {
+	if e.DedupeKey == "" {
+		e.DedupeKey = e.identity()
+	}
+	return nil
+}
+
+// identity returns the key that uniquely identifies the emote within the
+// in-memory database. The name is part of it because 7tv sets can contain
+// several aliases of the same emote.
+func (e *Emote) identity() string {
+	return emoteKey(e.Source, e.Id, e.Name, e.ChannelID, e.OwnerID)
+}
+
+// CachedEmote is the persisted emote catalog. It mirrors Emote so that a
+// chat can render its emotes immediately on startup, before the emote lists
+// are fetched again, and so that changed emotes can be detected when they
+// are.
+type CachedEmote struct {
+	Key string `gorm:"primaryKey"`
+	Id  string `gorm:"index"`
+
+	Source    EmoteSourceEnum
+	Name      string
+	Animated  bool
+	Width     int
+	Height    int
+	Version   string
+	ChannelID *string `gorm:"index"`
+	OwnerID   string  `gorm:"index"`
+}
+
+// BeforeCreate fills the key of cached emotes created directly, so a cached
+// emote has the same identity as its in-memory counterpart.
+func (e *CachedEmote) BeforeCreate(tx *gorm.DB) error {
+	if e.Key == "" {
+		e.Key = emoteKey(e.Source, e.Id, e.Name, e.ChannelID, e.OwnerID)
+	}
+	return nil
+}
+
+func emoteKey(source EmoteSourceEnum, id string, name string, channelID *string, ownerID string) string {
+	channel := ""
+	if channelID != nil {
+		channel = *channelID
+	}
+	return strconv.FormatInt(int64(source), 10) + ":" + id + ":" + name + ":" + channel + ":" + ownerID
+}
+
+// emote returns the in-memory emote of the cached catalog entry.
+func (e *CachedEmote) emote() Emote {
+	return Emote{
+		Id:        e.Id,
+		Source:    e.Source,
+		Name:      e.Name,
+		Animated:  e.Animated,
+		Width:     e.Width,
+		Height:    e.Height,
+		Version:   e.Version,
+		ChannelID: e.ChannelID,
+		OwnerID:   e.OwnerID,
+		DedupeKey: e.Key,
+	}
+}
+
+// cachedEmote returns the catalog entry of the in-memory emote.
+func cachedEmote(e *Emote) CachedEmote {
+	return CachedEmote{
+		Key:       emoteKey(e.Source, e.Id, e.Name, e.ChannelID, e.OwnerID),
+		Id:        e.Id,
+		Source:    e.Source,
+		Name:      e.Name,
+		Animated:  e.Animated,
+		Width:     e.Width,
+		Height:    e.Height,
+		Version:   e.Version,
+		ChannelID: e.ChannelID,
+		OwnerID:   e.OwnerID,
+	}
 }
 
 func (e *Emote) GetUrl() (string, error) {

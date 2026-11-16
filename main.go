@@ -43,6 +43,7 @@ import (
 	"golang.org/x/exp/shiny/materialdesign/icons"
 	_ "golang.org/x/image/webp"
 
+	"github.com/Hashy-Software/hasherino-go/emotecache"
 	"github.com/Hashy-Software/hasherino-go/hasherino"
 )
 
@@ -886,6 +887,53 @@ func loadChannelEmotes(window *app.Window, hc *hasherino.HasherinoController, ta
 			}
 			last = signature
 			tab.chat.setEmotes(emotes)
+			for _, emote := range emotes {
+				emoteStore.Revalidate(emote)
+			}
+			warmChannelEmotes(window, emotes)
+			window.Invalidate()
+		}
+	}()
+}
+
+// warmEmoteLimit caps how many emotes are decoded ahead of the first layout,
+// so a channel with thousands of cached emotes does not block startup.
+const warmEmoteLimit = 64
+
+// warmChannelEmotes decodes the cached files of the channel in the
+// background, so the first messages render their emotes immediately instead
+// of one repaint per emote. Uncached emotes are left to the normal lazy
+// loading.
+func warmChannelEmotes(window *app.Window, emotes []*hasherino.Emote) {
+	cached := make([]*hasherino.Emote, 0, len(emotes))
+	for _, emote := range emotes {
+		if len(cached) >= warmEmoteLimit {
+			break
+		}
+		if emoteStore.Cached(emote) {
+			cached = append(cached, emote)
+		}
+	}
+	if len(cached) == 0 {
+		return
+	}
+
+	go func() {
+		loaded := 0
+		for _, emote := range cached {
+			_, generation, load := requestChatEmoteMedia(emote)
+			if !load {
+				continue
+			}
+			media, err := downloadChatEmote(emote)
+			if err != nil {
+				finishChatEmoteMedia(emote, generation, nil)
+				continue
+			}
+			finishChatEmoteMedia(emote, generation, media)
+			loaded++
+		}
+		if loaded > 0 {
 			window.Invalidate()
 		}
 	}()
@@ -911,7 +959,11 @@ func channelEmoteSignature(emotes []*hasherino.Emote) string {
 		if emote == nil {
 			continue
 		}
-		entries = append(entries, strconv.FormatInt(int64(emote.Source), 10)+":"+emote.Id+":"+emote.Name)
+		entries = append(entries, strconv.FormatInt(int64(emote.Source), 10)+":"+
+			emote.Id+":"+emote.Name+":"+
+			strconv.FormatBool(emote.Animated)+":"+
+			strconv.Itoa(emote.Width)+"x"+strconv.Itoa(emote.Height)+":"+
+			emote.Version)
 	}
 	sort.Strings(entries)
 	return strings.Join(entries, "\x00")
@@ -1286,12 +1338,29 @@ var (
 	chatEmoteMedia  = &chatEmoteMediaCache{
 		entries: make(map[string]*chatEmoteMediaEntry),
 	}
+	// emoteStore persists the downloaded emote files. run replaces the
+	// memory-only default with the store in the user's cache folder.
+	emoteStore = emotecache.NewMemory()
 )
+
+// openEmoteStore opens the persistent emote cache, falling back to a
+// memory-only cache when no cache folder is available.
+func openEmoteStore() *emotecache.Store {
+	store, err := emotecache.OpenDefault()
+	if err != nil {
+		log.Printf("Failed to open the emote cache: %s", err)
+		return emotecache.NewMemory()
+	}
+	return store
+}
 
 type chatEmoteMediaEntry struct {
 	media   *chatMedia
 	loading bool
 	failed  bool
+	// generation changes when the media is invalidated, so a load that was
+	// already in flight cannot store the old content again
+	generation uint64
 }
 
 // chatEmoteMediaCache keeps the decoded files of emotes in memory, shared by
@@ -1318,8 +1387,9 @@ func cachedChatEmoteMedia(emote *hasherino.Emote) *chatMedia {
 }
 
 // requestChatEmoteMedia returns the media of the emote when it is already
-// loaded and reports whether the caller should start loading it.
-func requestChatEmoteMedia(emote *hasherino.Emote) (media *chatMedia, load bool) {
+// loaded and reports whether the caller should start loading it. The returned
+// generation must be passed to finishChatEmoteMedia.
+func requestChatEmoteMedia(emote *hasherino.Emote) (media *chatMedia, generation uint64, load bool) {
 	key := chatEmoteKey(emote)
 	chatEmoteMedia.mu.Lock()
 	defer chatEmoteMedia.mu.Unlock()
@@ -1329,26 +1399,49 @@ func requestChatEmoteMedia(emote *hasherino.Emote) (media *chatMedia, load bool)
 		chatEmoteMedia.entries[key] = entry
 	}
 	if entry.media != nil {
-		return entry.media, false
+		return entry.media, entry.generation, false
 	}
 	if entry.loading || entry.failed {
-		return nil, false
+		return nil, entry.generation, false
 	}
 	entry.loading = true
-	return nil, true
+	return nil, entry.generation, true
 }
 
-func finishChatEmoteMedia(emote *hasherino.Emote, media *chatMedia) {
+// finishChatEmoteMedia stores the media of a load that was started by
+// requestChatEmoteMedia. It is ignored when the emote was invalidated in the
+// meantime, so an old file cannot replace the new content.
+func finishChatEmoteMedia(emote *hasherino.Emote, generation uint64, media *chatMedia) {
 	chatEmoteMedia.mu.Lock()
 	defer chatEmoteMedia.mu.Unlock()
 	entry, ok := chatEmoteMedia.entries[chatEmoteKey(emote)]
-	if !ok {
-		entry = &chatEmoteMediaEntry{}
-		chatEmoteMedia.entries[chatEmoteKey(emote)] = entry
+	if !ok || entry.generation != generation {
+		return
 	}
 	entry.loading = false
 	entry.media = media
 	entry.failed = media == nil
+}
+
+// forgetChatEmote drops the decoded media of an emote, so the next layout
+// loads its new file. It is called when the emote list or the cache reports
+// changed content.
+func forgetChatEmote(emote *hasherino.Emote) {
+	if emote == nil {
+		return
+	}
+	chatEmoteMedia.mu.Lock()
+	key := chatEmoteKey(emote)
+	entry, ok := chatEmoteMedia.entries[key]
+	if !ok {
+		entry = &chatEmoteMediaEntry{}
+		chatEmoteMedia.entries[key] = entry
+	}
+	entry.generation++
+	entry.media = nil
+	entry.loading = false
+	entry.failed = false
+	chatEmoteMedia.mu.Unlock()
 }
 
 // loadChatEmote starts downloading and decoding the emote unless it is
@@ -1357,7 +1450,7 @@ func loadChatEmote(window *app.Window, emote *hasherino.Emote) {
 	if emote == nil {
 		return
 	}
-	_, load := requestChatEmoteMedia(emote)
+	_, generation, load := requestChatEmoteMedia(emote)
 	if !load {
 		return
 	}
@@ -1365,10 +1458,10 @@ func loadChatEmote(window *app.Window, emote *hasherino.Emote) {
 		media, err := downloadChatEmote(emote)
 		if err != nil {
 			log.Printf("Failed to load emote %s: %s", emote.Name, err)
-			finishChatEmoteMedia(emote, nil)
+			finishChatEmoteMedia(emote, generation, nil)
 			return
 		}
-		finishChatEmoteMedia(emote, media)
+		finishChatEmoteMedia(emote, generation, media)
 		window.Invalidate()
 	}()
 }
@@ -1474,19 +1567,22 @@ func downloadChatBadge(url string) (*chatMedia, error) {
 }
 
 func downloadChatEmote(emote *hasherino.Emote) (*chatMedia, error) {
-	url, err := emote.GetUrl()
+	data, cached, err := emoteStore.Load(emote)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := chatEmoteClient.Get(url)
-	if err != nil {
+	media, err := decodeChatMedia(data)
+	if err == nil {
+		return media, nil
+	}
+	if !cached {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("downloading emote %s failed: %s", emote.Name, resp.Status)
-	}
-	data, err := io.ReadAll(resp.Body)
+
+	// the cached file is unreadable, for example because it was truncated
+	// when the app was killed; drop it and download a fresh copy
+	emoteStore.Invalidate(emote)
+	data, _, err = emoteStore.Load(emote)
 	if err != nil {
 		return nil, err
 	}
@@ -3233,6 +3329,21 @@ func run(window *app.Window) error {
 	if err != nil {
 		return err
 	}
+
+	emoteStore = openEmoteStore()
+	hc.SetEmoteRefreshHook(func(emotes []*hasherino.Emote) {
+		// a refreshed list reported new or changed content; drop the old
+		// decoded copies and let the next layout load the new files
+		for _, emote := range emotes {
+			forgetChatEmote(emote)
+		}
+		emoteStore.InvalidateAll(emotes)
+	})
+	emoteStore.SetOnUpdate(func(emote *hasherino.Emote) {
+		// a background revalidation found a new version of the file
+		forgetChatEmote(emote)
+		window.Invalidate()
+	})
 
 	settingsButton := new(widget.Clickable)
 	settingsIcon, err := widget.NewIcon(icons.ActionSettings)
