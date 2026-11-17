@@ -3229,6 +3229,7 @@ func layoutDeviceAuthContent(gtx layout.Context, theme *material.Theme, state *d
 func main() {
 	go func() {
 		window := new(app.Window)
+		window.Option(app.Title("hasherino"))
 		err := run(window)
 		if err != nil {
 			log.Fatal(err)
