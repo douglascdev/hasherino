@@ -55,6 +55,7 @@ STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hasherino-windows-XXXXXX")"
 trap 'rm -rf "$STAGE_DIR"' EXIT
 cp "$ROOT_DIR/main.go" "$ROOT_DIR/go.mod" "$ROOT_DIR/go.sum" "$STAGE_DIR/"
 cp -R "$ROOT_DIR/hasherino" "$STAGE_DIR/hasherino"
+cp -R "$ROOT_DIR/emotecache" "$STAGE_DIR/emotecache"
 
 cd "$STAGE_DIR"
 args=(-target windows -appid "$APP_ID" -name Hasherino -arch amd64 -o "$OUTPUT")
