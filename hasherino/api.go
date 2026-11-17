@@ -23,6 +23,10 @@ import (
 	"github.com/pkg/browser"
 )
 
+// twitchTokenEndpoint is the oauth token endpoint. It is a variable so tests
+// can run the token exchange against a local server.
+var twitchTokenEndpoint = "https://id.twitch.tv/oauth2/token"
+
 type TwitchOAuth struct {
 	state string // Field from implicit grant flow used to prevent CSRF attacks
 }
@@ -46,9 +50,11 @@ func (t *TwitchOAuth) IsTokenValid(token string) bool {
 		log.Printf("Failed to validate token: %s", err)
 		return false
 	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
 
 	log.Printf("Token validation status code: %d", resp.StatusCode)
-	return resp.StatusCode == 200
+	return resp.StatusCode == http.StatusOK
 }
 
 func (t *TwitchOAuth) OpenOAuthPage(app_id string) {
@@ -292,7 +298,7 @@ func (t *TwitchOAuth) CheckDeviceAuth(ctx context.Context, clientID, scopes, dev
 	form.Set("grant_type", deviceCodeGrantType)
 
 	var token DeviceToken
-	if err := t.postOAuthForm(ctx, "https://id.twitch.tv/oauth2/token", form, &token); err != nil {
+	if err := t.postOAuthForm(ctx, twitchTokenEndpoint, form, &token); err != nil {
 		return nil, err
 	}
 	return &token, nil
@@ -341,7 +347,7 @@ func (t *TwitchOAuth) RefreshDeviceToken(ctx context.Context, clientID, refreshT
 	form.Set("refresh_token", refreshToken)
 
 	var token DeviceToken
-	if err := t.postOAuthForm(ctx, "https://id.twitch.tv/oauth2/token", form, &token); err != nil {
+	if err := t.postOAuthForm(ctx, twitchTokenEndpoint, form, &token); err != nil {
 		return nil, err
 	}
 	return &token, nil

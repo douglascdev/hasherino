@@ -3,6 +3,7 @@ package hasherino
 import (
 	"errors"
 	"strconv"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -14,6 +15,11 @@ type Account struct {
 	DisplayName string
 	Active      bool
 	Token       string // TODO: enable db encryption to hide token
+	// RefreshToken is the device-flow refresh token. Twitch rotates it on
+	// every refresh, so the newest value has to be stored.
+	RefreshToken string
+	// TokenExpiresAt is when Token expires, zero when unknown.
+	TokenExpiresAt time.Time
 }
 
 type Tab struct {

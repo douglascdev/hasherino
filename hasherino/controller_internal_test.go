@@ -63,8 +63,9 @@ func newSearchEmoteController(t *testing.T) *HasherinoController {
 	}
 
 	return &HasherinoController{
-		memDB:  newDB(&Emote{}),
-		permDB: newDB(&Account{}, &Tab{}, &CachedEmote{}),
+		memDB:       newDB(&Emote{}),
+		permDB:      newDB(&Account{}, &Tab{}, &CachedEmote{}),
+		twitchOAuth: NewTwitchOAuth(),
 	}
 }
 

@@ -384,7 +384,7 @@ type deviceAuthState struct {
 	openErr         string
 	events          <-chan deviceAuthEvent
 	cancel          context.CancelFunc
-	onAccount       func(id, login, token string) error
+	onAccount       func(id, login, accessToken, refreshToken string, expiresAt time.Time) error
 	backdrop        widget.Clickable
 	openButton      widget.Clickable
 	copyButton      widget.Clickable
@@ -2491,8 +2491,12 @@ func (a *deviceAuthState) apply(event deviceAuthEvent, menu *usersMenuState) {
 	case event.token != nil:
 		a.pending = false
 		if event.login != "" {
+			expiresAt := time.Time{}
+			if event.token.ExpiresIn > 0 {
+				expiresAt = time.Now().Add(time.Duration(event.token.ExpiresIn) * time.Second)
+			}
 			if a.onAccount != nil {
-				if err := a.onAccount(event.id, event.login, event.token.AccessToken); err != nil {
+				if err := a.onAccount(event.id, event.login, event.token.AccessToken, event.token.RefreshToken, expiresAt); err != nil {
 					a.errText = fmt.Sprintf("Could not save %s: %s", event.login, err)
 					return
 				}
@@ -3386,17 +3390,20 @@ func run(window *app.Window) error {
 	}
 
 	deviceAuth := &deviceAuthState{}
-	deviceAuth.onAccount = func(id, login, token string) error {
+	deviceAuth.onAccount = func(id, login, accessToken, refreshToken string, expiresAt time.Time) error {
 		hadActiveAccount := false
-		if _, err := hc.GetActiveAccount(); err == nil {
+		wasActive := false
+		if account, err := hc.GetActiveAccount(); err == nil {
 			hadActiveAccount = true
+			wasActive = account.Id == id
 		}
-		if err := hc.UpsertAccount(id, login, token); err != nil {
+		if err := hc.UpsertAccountWithToken(id, login, accessToken, refreshToken, expiresAt); err != nil {
 			return err
 		}
-		if !hadActiveAccount {
-			// The new account became the active one, so the chat connection
-			// has to be established with its token.
+		if !hadActiveAccount || wasActive {
+			// The account is (or just became) the active one. Reconnect the
+			// sending socket so it uses the fresh token.
+			hc.ReconnectChat()
 			listening.Store(false)
 		}
 		startListening()

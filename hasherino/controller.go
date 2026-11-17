@@ -1,6 +1,7 @@
 package hasherino
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -25,10 +27,21 @@ type HasherinoController struct {
 	selectedTab string
 	callbackMap map[string]func(ChatMessage)
 	twitchOAuth *TwitchOAuth
-	readWS      *TwitchChatWebsocket
-	writeWS     *TwitchChatWebsocket
-	memDB       *gorm.DB
-	permDB      *gorm.DB
+	// socketLock guards the readWS and writeWS pointers. The sockets
+	// themselves are safe for concurrent use, but reconnecting replaces the
+	// pointer while the ui is sending.
+	socketLock sync.RWMutex
+	readWS     *TwitchChatWebsocket
+	writeWS    *TwitchChatWebsocket
+	// authRefreshLock serializes token refreshes, so a proactive refresh and
+	// an authentication failure cannot rotate the token twice.
+	authRefreshLock sync.Mutex
+	// listenLock and writeConnectLock serialize connection setup, so two
+	// callers cannot replace a socket and leak the other connection.
+	listenLock       sync.Mutex
+	writeConnectLock sync.Mutex
+	memDB            *gorm.DB
+	permDB           *gorm.DB
 	// userEmotesLock and userEmotesLoadedId guard that the twitch emotes of
 	// an account are only loaded once per run
 	userEmotesLock     sync.Mutex
@@ -39,7 +52,16 @@ type HasherinoController struct {
 	emoteRefreshHook func([]*Emote)
 }
 
-const defaultClientID = "hvmj7blkwy2gw3xf820n47i85g4sub"
+const (
+	defaultClientID = "hvmj7blkwy2gw3xf820n47i85g4sub"
+	// tokenRefreshMargin is how long before expiry a token is refreshed, so
+	// a reconnect never races the expiry.
+	tokenRefreshMargin = 5 * time.Minute
+	// tokenRefreshTimeout limits a token refresh request.
+	tokenRefreshTimeout = 30 * time.Second
+)
+
+var errNoRefreshToken = errors.New("the account has no refresh token; re-authorize it")
 
 func (hc *HasherinoController) New(callbackMap map[string]func(ChatMessage)) (*HasherinoController, error) {
 	return hc.NewWithClientID(callbackMap, defaultClientID)
@@ -166,8 +188,20 @@ func (hc *HasherinoController) AddAccount(id string, login string, token string)
 
 // UpsertAccount saves the account, creating it when needed. An existing
 // account keeps its active state, unless no account is active, in which case
-// this account becomes the active one.
+// this account becomes the active one. The refresh token and expiry of an
+// existing account are preserved.
 func (hc *HasherinoController) UpsertAccount(id string, login string, token string) error {
+	return hc.upsertAccount(id, login, token, nil, nil)
+}
+
+// UpsertAccountWithToken saves the account including the refresh token and
+// expiry returned by the device flow, so the access token can be refreshed
+// later without asking the user again.
+func (hc *HasherinoController) UpsertAccountWithToken(id string, login string, token string, refreshToken string, expiresAt time.Time) error {
+	return hc.upsertAccount(id, login, token, &refreshToken, &expiresAt)
+}
+
+func (hc *HasherinoController) upsertAccount(id string, login string, token string, refreshToken *string, expiresAt *time.Time) error {
 	return hc.permDB.Transaction(func(tx *gorm.DB) error {
 		account := &Account{}
 		result := tx.Take(account, "Id = ?", id)
@@ -178,6 +212,12 @@ func (hc *HasherinoController) UpsertAccount(id string, login string, token stri
 			}
 			active := activeCount == 0
 			account = &Account{Id: id, Login: login, Token: token, Active: active}
+			if refreshToken != nil {
+				account.RefreshToken = *refreshToken
+			}
+			if expiresAt != nil {
+				account.TokenExpiresAt = *expiresAt
+			}
 			return tx.Create(account).Error
 		}
 		if result.Error != nil {
@@ -193,6 +233,12 @@ func (hc *HasherinoController) UpsertAccount(id string, login string, token stri
 		}
 		account.Login = login
 		account.Token = token
+		if refreshToken != nil && *refreshToken != "" {
+			account.RefreshToken = *refreshToken
+		}
+		if expiresAt != nil {
+			account.TokenExpiresAt = *expiresAt
+		}
 		return tx.Save(account).Error
 	})
 }
@@ -205,7 +251,7 @@ func (hc *HasherinoController) RemoveAccount(id string) error {
 			return result.Error
 		}
 		if account.Active {
-			hc.writeWS.Close()
+			hc.ReconnectChat()
 		}
 		result = tx.Delete(&account)
 		if result.Error != nil {
@@ -254,7 +300,7 @@ func (hc *HasherinoController) SetActiveAccount(id string) error {
 	// make the emotes of the newly active account available right away
 	hc.hydrateEmoteCatalog()
 
-	hc.writeWS.Close()
+	hc.ReconnectChat()
 	go func() {
 		if err := hc.Listen(); err != nil {
 			log.Printf("failed to connect after activating account: %s", err)
@@ -287,8 +333,7 @@ func (hc *HasherinoController) AddTab(channel string) error {
 
 	channelId := ""
 	err := hc.permDB.Transaction(func(tx *gorm.DB) error {
-		_, exists := hc.readWS.channels[channel]
-		if exists {
+		if readWS := hc.readSocket(); readWS != nil && readWS.HasChannel(channel) {
 			return errors.New("already joined channel " + channel)
 		}
 
@@ -317,10 +362,12 @@ func (hc *HasherinoController) AddTab(channel string) error {
 			return result.Error
 		}
 
-		err = hc.readWS.Join(login)
-		if err != nil {
-			log.Printf("failed to join channel %s: %s", login, err)
-			return errors.New("failed to join channel " + login)
+		if readWS := hc.readSocket(); readWS != nil {
+			if err := readWS.Join(login); err != nil {
+				// the channel is remembered anyway and the reader joins it
+				// again after reconnecting
+				log.Printf("failed to join channel %s: %s", login, err)
+			}
 		}
 
 		channelId = users.Data[0].ID
@@ -805,9 +852,12 @@ func (hc *HasherinoController) RemoveTab(id string) error {
 			return result.Error
 		}
 
-		err := hc.readWS.Part(tab.Login)
-		if err != nil {
-			return errors.New("failed to part channel" + tab.Login)
+		if readWS := hc.readSocket(); readWS != nil {
+			if err := readWS.Part(tab.Login); err != nil {
+				// the channel is removed locally either way; the reader
+				// reconnects without it
+				log.Printf("failed to part channel %s: %s", tab.Login, err)
+			}
 		}
 
 		return nil
@@ -916,29 +966,209 @@ func (hc *HasherinoController) loadUserEmotes(account *Account) {
 	log.Println("Loaded " + strconv.Itoa(len(emoteObjs)) + " twitch user emotes for " + account.Login)
 }
 
+func (hc *HasherinoController) writeSocket() *TwitchChatWebsocket {
+	if hc == nil {
+		return nil
+	}
+	hc.socketLock.RLock()
+	defer hc.socketLock.RUnlock()
+	return hc.writeWS
+}
+
+func (hc *HasherinoController) readSocket() *TwitchChatWebsocket {
+	if hc == nil {
+		return nil
+	}
+	hc.socketLock.RLock()
+	defer hc.socketLock.RUnlock()
+	return hc.readWS
+}
+
+func (hc *HasherinoController) setWriteSocket(ws *TwitchChatWebsocket) {
+	hc.socketLock.Lock()
+	defer hc.socketLock.Unlock()
+	hc.writeWS = ws
+}
+
+func (hc *HasherinoController) setReadSocket(ws *TwitchChatWebsocket) {
+	hc.socketLock.Lock()
+	defer hc.socketLock.Unlock()
+	hc.readWS = ws
+}
+
+// ReconnectChat closes the authenticated socket so the next Listen connects
+// again with the current account token.
+func (hc *HasherinoController) ReconnectChat() {
+	if ws := hc.writeSocket(); ws != nil {
+		ws.Close()
+	}
+}
+
+// connectWriteSocket connects the sending socket with the active account's
+// token, refreshing the token first when it is about to expire.
+func (hc *HasherinoController) connectWriteSocket() error {
+	hc.writeConnectLock.Lock()
+	defer hc.writeConnectLock.Unlock()
+
+	account, err := hc.GetActiveAccount()
+	if err != nil {
+		return err
+	}
+	hc.refreshTokenIfNeeded(account)
+
+	ws, err := (&TwitchChatWebsocket{}).New("oauth:"+account.Token, account.Login)
+	if err != nil {
+		return err
+	}
+	if err := ws.Connect(); err != nil {
+		return err
+	}
+	old := hc.writeSocket()
+	hc.setWriteSocket(ws)
+	if old != nil {
+		old.Close()
+	}
+	ws.StartListening(nil, hc.handleWriteAuthError)
+	return nil
+}
+
+// refreshTokenIfNeeded refreshes the token when it is expired or about to
+// expire. A failure is logged and the current token is kept; reconnecting may
+// still work when the expiry metadata is stale.
+func (hc *HasherinoController) refreshTokenIfNeeded(account *Account) {
+	if account == nil || account.TokenExpiresAt.IsZero() {
+		return
+	}
+	if time.Until(account.TokenExpiresAt) > tokenRefreshMargin {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), tokenRefreshTimeout)
+	defer cancel()
+	if err := hc.refreshActiveAccountToken(ctx, account); err != nil {
+		log.Printf("Failed to refresh the twitch token of %s: %s", account.Login, err)
+	}
+}
+
+// refreshActiveAccountToken exchanges the account's refresh token for a new
+// access token and persists the rotated pair. Device-flow refresh tokens are
+// single use, so the new refresh token must be stored.
+func (hc *HasherinoController) refreshActiveAccountToken(ctx context.Context, account *Account) error {
+	if account == nil {
+		return errors.New("no active account")
+	}
+	hc.authRefreshLock.Lock()
+	defer hc.authRefreshLock.Unlock()
+
+	// another refresh or a re-authorization may have rotated the tokens
+	// while this one was waiting for the lock; use the newest values
+	latest := &Account{}
+	if err := hc.permDB.Take(latest, "id = ?", account.Id).Error; err == nil {
+		account.Token = latest.Token
+		account.RefreshToken = latest.RefreshToken
+		account.TokenExpiresAt = latest.TokenExpiresAt
+	}
+
+	if account.RefreshToken == "" {
+		return errNoRefreshToken
+	}
+	usedRefreshToken := account.RefreshToken
+	token, err := hc.twitchOAuth.RefreshDeviceToken(ctx, hc.appId, usedRefreshToken)
+	if err != nil {
+		return err
+	}
+	if token.AccessToken == "" {
+		return errors.New("twitch returned an empty access token")
+	}
+	refreshToken := token.RefreshToken
+	if refreshToken == "" {
+		refreshToken = account.RefreshToken
+	}
+	var expiresAt time.Time
+	if token.ExpiresIn > 0 {
+		expiresAt = time.Now().Add(time.Duration(token.ExpiresIn) * time.Second)
+	}
+
+	// only store the result when the refresh token is still the one that was
+	// exchanged; re-authorizing the account rotates it as well, and must win
+	result := hc.permDB.Model(&Account{}).
+		Where("id = ? AND refresh_token = ?", account.Id, usedRefreshToken).
+		Updates(map[string]interface{}{
+			"token":            token.AccessToken,
+			"refresh_token":    refreshToken,
+			"token_expires_at": expiresAt,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return errors.New("the account tokens changed while refreshing")
+	}
+	account.Token = token.AccessToken
+	account.RefreshToken = refreshToken
+	account.TokenExpiresAt = expiresAt
+	log.Printf("Refreshed the twitch token of %s", account.Login)
+	return nil
+}
+
+// handleWriteAuthError refreshes the rejected token and reconnects the
+// sending socket. It runs in its own goroutine because the listener stops
+// after an authentication failure.
+func (hc *HasherinoController) handleWriteAuthError() {
+	go func() {
+		log.Println("Twitch rejected the chat token; refreshing it")
+		account, err := hc.GetActiveAccount()
+		if err != nil {
+			log.Printf("Failed to refresh the chat token: %s", err)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), tokenRefreshTimeout)
+		defer cancel()
+		if err := hc.refreshActiveAccountToken(ctx, account); err != nil {
+			log.Printf("Failed to refresh the chat token: %s; re-authorize the account", err)
+			return
+		}
+		if err := hc.connectWriteSocket(); err != nil {
+			log.Printf("Failed to reconnect chat after refreshing the token: %s", err)
+			return
+		}
+		// the emotes of the account may have failed while the token was
+		// expired; retrying is a no-op when they already loaded
+		if active, err := hc.GetActiveAccount(); err == nil {
+			account := *active
+			go hc.loadUserEmotes(&account)
+		}
+	}()
+}
+
 func (hc *HasherinoController) Listen() error {
+	hc.listenLock.Lock()
+	defer hc.listenLock.Unlock()
+
 	activeAccount, err := hc.GetActiveAccount()
 	if err == nil {
-		go hc.loadUserEmotes(activeAccount)
-		if hc.writeWS == nil || hc.writeWS.State == Disconnected {
-			hc.writeWS, err = hc.writeWS.New("oauth:"+activeAccount.Token, activeAccount.Login)
-			if err != nil {
-				return err
-			}
-			err = hc.writeWS.Connect()
-			if err != nil {
-				return err
-			}
+		// refresh before the helix calls below, so an expired token does not
+		// fail the emote list load
+		hc.refreshTokenIfNeeded(activeAccount)
+		account := *activeAccount
+		go hc.loadUserEmotes(&account)
+		// always reconnect: Listen is called when the active account or its
+		// token changed, and the socket has to use the current credentials
+		if err := hc.connectWriteSocket(); err != nil {
+			return err
 		}
 	}
-	if hc.readWS == nil || hc.readWS.State == Disconnected {
-		hc.readWS, err = hc.readWS.New("SCHMOOPIIE", "justinfan71097")
+	if ws := hc.readSocket(); ws == nil || !ws.IsConnected() {
+		ws, err := (&TwitchChatWebsocket{}).New("SCHMOOPIIE", "justinfan71097")
 		if err != nil {
 			return err
 		}
-		err = hc.readWS.Connect()
-		if err != nil {
+		if err := ws.Connect(); err != nil {
 			return err
+		}
+		old := hc.readSocket()
+		hc.setReadSocket(ws)
+		if old != nil {
+			old.Close()
 		}
 	}
 
@@ -957,29 +1187,40 @@ func (hc *HasherinoController) Listen() error {
 		callback(*msg)
 	}
 
+	readWS := hc.readSocket()
+	if readWS == nil {
+		return errors.New("chat reader is not connected")
+	}
 	for channel := range hc.callbackMap {
-		_, joinedChannel := hc.writeWS.channels[channel]
-		if !joinedChannel {
-			hc.readWS.Join(channel)
+		if !readWS.HasChannel(channel) {
+			if err := readWS.Join(channel); err != nil {
+				log.Printf("Failed to join channel %s: %s", channel, err)
+			}
 		}
 	}
-
-	go hc.readWS.Listen(callbackWrapper)
+	readWS.StartListening(callbackWrapper, nil)
 	return nil
 }
 
 func (hc *HasherinoController) IsChannelJoined(channel string) bool {
-	if hc.readWS == nil || hc.readWS.State == Disconnected {
-		return false
-	}
-
-	_, joinedChannel := hc.readWS.channels[channel]
-	return joinedChannel
+	readWS := hc.readSocket()
+	return readWS != nil && readWS.IsConnected() && readWS.HasChannel(channel)
 }
 
 func (hc *HasherinoController) SendMessage(channel string, message string) error {
-	err := hc.writeWS.Send(channel, message)
-	return err
+	ws := hc.writeSocket()
+	if ws == nil {
+		return ErrNotConnected
+	}
+	if err := ws.Send(channel, message); err != nil {
+		// the socket may have been replaced by a reconnect between reading
+		// the pointer and writing; retry once on the new connection
+		if current := hc.writeSocket(); current != nil && current != ws && current.IsConnected() {
+			return current.Send(channel, message)
+		}
+		return err
+	}
+	return nil
 }
 
 func (hc *HasherinoController) GetSettings() (*AppSettings, error) {

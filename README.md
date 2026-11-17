@@ -20,6 +20,14 @@ used for 30 days are removed, and the cache is capped at 512 MiB. Cached files
 are revalidated in the background when their emote list loads. Set
 `HASHERINO_CACHE_DIR` to use a different folder.
 
+## Account tokens
+
+Accounts added through Twitch's device-code flow keep their refresh token and
+renew the access token automatically; Twitch device-flow access tokens are
+short lived and the rotated refresh token is stored after every renewal.
+Accounts saved by older versions have no refresh token, so re-add them once to
+enable automatic renewal.
+
 ## Install with Flatpak
 
 ### From a prebuilt bundle
