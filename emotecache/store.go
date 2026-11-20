@@ -200,6 +200,9 @@ func Key(emote *hasherino.Emote) string {
 		}
 		key += "-" + version
 	}
+	if resolution := sanitize(emote.Resolution); resolution != "" {
+		key += "-" + resolution
+	}
 	return key + extension
 }
 

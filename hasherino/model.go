@@ -97,13 +97,16 @@ type Emote struct {
 	Source EmoteSourceEnum `gorm:"primaryKey"`
 	Name   string          `gorm:"primaryKey"` // aliases of one emote are separate rows
 
-	Animated  bool
-	Width     int       // intrinsic width of the emote from its CDN, 0 when unknown
-	Height    int       // intrinsic height of the emote from its CDN, 0 when unknown
-	Version   string    // identifies the content of the emote's file, empty when unknown
-	ChannelID *string   `gorm:"primaryKey"`                       // if a channel is set, only renders in that channel
-	OwnerID   string    `gorm:"primaryKey;index"`                 // Foreign key field
-	Owner     *ChatUser `gorm:"foreignKey:OwnerID;references:Id"` // if an owner is set, only renders when the message sender is the owner
+	Animated bool
+	Width    int    // intrinsic width of the emote from its CDN, 0 when unknown
+	Height   int    // intrinsic height of the emote from its CDN, 0 when unknown
+	Version  string // identifies the content of the emote's file, empty when unknown
+	// Resolution selects a one-off cdn size for a preview, like "4x" or
+	// "3.0". It is empty for the normal chat size and is never persisted.
+	Resolution string    `gorm:"-"`
+	ChannelID  *string   `gorm:"primaryKey"`                       // if a channel is set, only renders in that channel
+	OwnerID    string    `gorm:"primaryKey;index"`                 // Foreign key field
+	Owner      *ChatUser `gorm:"foreignKey:OwnerID;references:Id"` // if an owner is set, only renders when the message sender is the owner
 
 	// DedupeKey is a non-null identity for the emote. The composite primary
 	// key contains a nullable ChannelID, and SQLite treats NULLs as distinct,
@@ -195,12 +198,19 @@ func cachedEmote(e *Emote) CachedEmote {
 }
 
 func (e *Emote) GetUrl() (string, error) {
+	resolution := e.Resolution
 	var result string
 	switch e.Source {
 	case Twitch:
-		result = "https://static-cdn.jtvnw.net/emoticons/v2/" + e.Id + "/default/dark/2.0"
+		if resolution == "" {
+			resolution = "2.0"
+		}
+		result = "https://static-cdn.jtvnw.net/emoticons/v2/" + e.Id + "/default/dark/" + resolution
 	case SevenTV:
-		result = "https://cdn.7tv.app/emote/" + e.Id + "/2x"
+		if resolution == "" {
+			resolution = "2x"
+		}
+		result = "https://cdn.7tv.app/emote/" + e.Id + "/" + resolution
 	default:
 		return "", errors.New("Unknown emote source")
 	}

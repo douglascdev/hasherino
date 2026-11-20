@@ -62,6 +62,9 @@ type chatPart struct {
 	text  string
 	emote *hasherino.Emote
 	media *chatMedia
+	// hover tags the rendered emote, so the tooltip knows which emote the
+	// pointer entered or left. It is stable while the part exists.
+	hover *emoteHover
 	// links holds one clickable per url found in the text part. It is shared
 	// across the message copies made during layout so click state persists.
 	links map[string]*widget.Clickable
@@ -506,6 +509,7 @@ func (c *chat) buildPartsLocked(text string, ownEmotes map[string]*hasherino.Emo
 		parts = append(parts, chatPart{
 			emote: emote,
 			media: cachedChatEmoteMedia(emote),
+			hover: &emoteHover{},
 		})
 	}
 	flushText()
@@ -653,6 +657,7 @@ type emoteSearchEvent struct {
 type emoteSuggestionRow struct {
 	emote  *hasherino.Emote
 	button widget.Clickable
+	hover  *emoteHover
 }
 
 type messageInputState struct {
@@ -711,7 +716,7 @@ func (s *messageInputState) showSuggestions(emotes []*hasherino.Emote) {
 	s.suggestions = suggestions
 	s.rows = make([]emoteSuggestionRow, len(suggestions))
 	for i, suggestion := range suggestions {
-		s.rows[i] = emoteSuggestionRow{emote: suggestion}
+		s.rows[i] = emoteSuggestionRow{emote: suggestion, hover: &emoteHover{}}
 	}
 	if s.selected >= len(suggestions) {
 		s.selected = 0
@@ -1543,7 +1548,7 @@ func layoutEmoteSuggestions(gtx layout.Context, theme *material.Theme, state *me
 							if media := cachedChatEmoteMedia(row.emote); media != nil {
 								widgets = append(widgets,
 									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-										return layoutInlineEmote(gtx, media, &animator)
+										return layoutInlineEmote(gtx, media, &animator, row.emote, row.hover)
 									}),
 									layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
 								)
@@ -1678,7 +1683,11 @@ type chatEmoteMediaCache struct {
 }
 
 func chatEmoteKey(emote *hasherino.Emote) string {
-	return strconv.FormatInt(int64(emote.Source), 10) + ":" + emote.Id
+	key := strconv.FormatInt(int64(emote.Source), 10) + ":" + emote.Id
+	if emote.Resolution != "" {
+		key += ":" + emote.Resolution
+	}
+	return key
 }
 
 func cachedChatEmoteMedia(emote *hasherino.Emote) *chatMedia {
@@ -1738,17 +1747,266 @@ func forgetChatEmote(emote *hasherino.Emote) {
 		return
 	}
 	chatEmoteMedia.mu.Lock()
-	key := chatEmoteKey(emote)
-	entry, ok := chatEmoteMedia.entries[key]
-	if !ok {
-		entry = &chatEmoteMediaEntry{}
-		chatEmoteMedia.entries[key] = entry
+	base := chatEmoteKey(emote)
+	prefix := base + ":"
+	found := false
+	for key, entry := range chatEmoteMedia.entries {
+		if key != base && !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		entry.generation++
+		entry.media = nil
+		entry.loading = false
+		entry.failed = false
+		found = true
 	}
-	entry.generation++
-	entry.media = nil
-	entry.loading = false
-	entry.failed = false
+	if !found {
+		chatEmoteMedia.entries[base] = &chatEmoteMediaEntry{generation: 1}
+	}
 	chatEmoteMedia.mu.Unlock()
+}
+
+// emoteHover tags one rendered emote so pointer enter, leave and press
+// events can be attributed to it. The field is not used: it makes the struct
+// non-zero-sized, because Go may give distinct zero-sized allocations the
+// same address, which would make every emote share one tag.
+type emoteHover struct {
+	tag byte
+}
+
+// emoteTooltipState shows the large preview of the emote under the pointer.
+// It is only touched from the ui goroutine during layout.
+type emoteTooltipState struct {
+	emote    *hasherino.Emote
+	hover    *emoteHover
+	position image.Point
+	visible  bool
+	// pinned keeps a touch-opened tooltip visible after the finger lifts.
+	pinned bool
+	// pressSeen is set by an emote press so the full-window click handler
+	// does not immediately dismiss the tooltip it opened.
+	pressSeen bool
+}
+
+var emoteTooltip = &emoteTooltipState{}
+
+// maxEmoteResolution returns the largest size the emote cdn serves.
+func maxEmoteResolution(source hasherino.EmoteSourceEnum) string {
+	switch source {
+	case hasherino.SevenTV:
+		return "4x"
+	case hasherino.Twitch:
+		return "3.0"
+	default:
+		return ""
+	}
+}
+
+func emoteSourceLabel(source hasherino.EmoteSourceEnum) string {
+	switch source {
+	case hasherino.SevenTV:
+		return "7TV"
+	case hasherino.Twitch:
+		return "Twitch"
+	default:
+		return "Unknown"
+	}
+}
+
+func (t *emoteTooltipState) show(emote *hasherino.Emote, hover *emoteHover, source pointer.Source) {
+	if emote == nil || hover == nil {
+		return
+	}
+	t.pinned = source != pointer.Mouse
+	if t.visible && t.hover == hover {
+		return
+	}
+	preview := *emote
+	preview.Resolution = maxEmoteResolution(emote.Source)
+	t.emote = &preview
+	t.hover = hover
+	t.visible = true
+}
+
+func (t *emoteTooltipState) hide() {
+	t.emote = nil
+	t.hover = nil
+	t.visible = false
+	t.pinned = false
+}
+
+func (t *emoteTooltipState) hideIf(hover *emoteHover) {
+	if t.pinned || t.hover != hover {
+		return
+	}
+	t.hide()
+}
+
+func (t *emoteTooltipState) markPress() {
+	t.pressSeen = true
+}
+
+func (t *emoteTooltipState) consumePress() bool {
+	seen := t.pressSeen
+	t.pressSeen = false
+	return seen
+}
+
+// layout draws the tooltip and registers the full-window pointer handler that
+// follows the cursor and dismisses the tooltip on an outside click.
+func (t *emoteTooltipState) layout(gtx layout.Context, theme *material.Theme, window *app.Window) layout.Dimensions {
+	area := clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops)
+	pass := pointer.PassOp{}.Push(gtx.Ops)
+	event.Op(gtx.Ops, t)
+	pass.Pop()
+	area.Pop()
+
+	changed := false
+	for {
+		ev, ok := gtx.Event(pointer.Filter{
+			Target: t,
+			Kinds:  pointer.Move | pointer.Press | pointer.Cancel,
+		})
+		if !ok {
+			break
+		}
+		e, ok := ev.(pointer.Event)
+		if !ok {
+			continue
+		}
+		switch e.Kind {
+		case pointer.Move:
+			t.position = e.Position.Round()
+		case pointer.Press:
+			t.position = e.Position.Round()
+			if !t.consumePress() && t.visible {
+				t.hide()
+				changed = true
+			}
+		case pointer.Cancel:
+			if t.visible {
+				t.hide()
+				changed = true
+			}
+		}
+	}
+	if changed {
+		gtx.Execute(op.InvalidateCmd{})
+	}
+
+	if !t.visible || t.emote == nil {
+		return layout.Dimensions{Size: gtx.Constraints.Max}
+	}
+
+	media := cachedChatEmoteMedia(t.emote)
+	if media == nil {
+		loadChatEmote(window, t.emote)
+	}
+
+	animator := chatAnimator{now: time.Now()}
+	macro := op.Record(gtx.Ops)
+	panelDims := layoutEmoteTooltipPanel(gtx, theme, t.emote, media, &animator)
+	panelCall := macro.Stop()
+
+	margin := gtx.Dp(unit.Dp(12))
+	x := t.position.X + margin
+	y := t.position.Y + margin
+	if x+panelDims.Size.X+margin > gtx.Constraints.Max.X {
+		x = t.position.X - panelDims.Size.X - margin
+	}
+	if y+panelDims.Size.Y+margin > gtx.Constraints.Max.Y {
+		y = t.position.Y - panelDims.Size.Y - margin
+	}
+	if maxX := gtx.Constraints.Max.X - panelDims.Size.X - margin; x > maxX {
+		x = maxX
+	}
+	if maxY := gtx.Constraints.Max.Y - panelDims.Size.Y - margin; y > maxY {
+		y = maxY
+	}
+	if x < margin {
+		x = margin
+	}
+	if y < margin {
+		y = margin
+	}
+
+	offset := op.Offset(image.Pt(x, y)).Push(gtx.Ops)
+	panelCall.Add(gtx.Ops)
+	offset.Pop()
+	animator.invalidate(gtx)
+	return layout.Dimensions{Size: gtx.Constraints.Max}
+}
+
+func layoutEmoteTooltipPanel(gtx layout.Context, theme *material.Theme, emote *hasherino.Emote, media *chatMedia, animator *chatAnimator) layout.Dimensions {
+	width := gtx.Dp(unit.Dp(200))
+	if width > gtx.Constraints.Max.X {
+		width = gtx.Constraints.Max.X
+	}
+	if width < 0 {
+		width = 0
+	}
+
+	background := func(gtx layout.Context) layout.Dimensions {
+		size := gtx.Constraints.Min
+		radius := gtx.Dp(unit.Dp(8))
+		panel := color.NRGBA{R: 0x1e, G: 0x1e, B: 0x24, A: 0xff}
+		paint.FillShape(gtx.Ops, panel, clip.UniformRRect(image.Rectangle{Max: size}, radius).Op(gtx.Ops))
+		return layout.Dimensions{Size: size}
+	}
+	content := func(gtx layout.Context) layout.Dimensions {
+		return layout.UniformInset(unit.Dp(10)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			children := make([]layout.FlexChild, 0, 4)
+			if media != nil {
+				children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layoutEmoteTooltipImage(gtx, media, animator)
+				}))
+				children = append(children, layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout))
+			}
+			children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				label := material.Body1(theme, emote.Name)
+				label.Color = theme.Fg
+				label.MaxLines = 1
+				return label.Layout(gtx)
+			}))
+			sourceColor := theme.Fg
+			sourceColor.A = 0x99
+			children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				label := material.Caption(theme, emoteSourceLabel(emote.Source))
+				label.Color = sourceColor
+				label.MaxLines = 1
+				return label.Layout(gtx)
+			}))
+			return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+		})
+	}
+
+	gtx.Constraints.Min.X = width
+	gtx.Constraints.Max.X = width
+	gtx.Constraints.Min.Y = 0
+	return layout.Background{}.Layout(gtx, background, content)
+}
+
+func layoutEmoteTooltipImage(gtx layout.Context, media *chatMedia, animator *chatAnimator) layout.Dimensions {
+	maxSize := gtx.Dp(unit.Dp(160))
+	width, height := maxSize, maxSize
+	if media.width > 0 && media.height > 0 {
+		if media.width >= media.height {
+			height = maxSize * media.height / media.width
+		} else {
+			width = maxSize * media.width / media.height
+		}
+	}
+	if width < 1 {
+		width = 1
+	}
+	if height < 1 {
+		height = 1
+	}
+	gtx.Constraints.Min = image.Point{}
+	gtx.Constraints.Max = image.Point{X: width, Y: height}
+	return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layoutChatMedia(gtx, media, animator)
+	})
 }
 
 // loadChatEmote starts downloading and decoding the emote unless it is
@@ -2338,14 +2596,14 @@ func layoutChatParts(gtx layout.Context, theme *material.Theme, message chatMess
 				continue
 			}
 			widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
-				return layoutInlineEmote(gtx, media, animator)
+				return layoutInlineEmote(gtx, media, animator, part.emote, part.hover)
 			})
 			widgets = append(widgets, layoutInlineSpacer(unit.Dp(3)))
 			continue
 		}
 		if part.media != nil {
 			widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
-				return layoutInlineEmote(gtx, part.media, animator)
+				return layoutInlineEmote(gtx, part.media, animator, part.emote, part.hover)
 			})
 			widgets = append(widgets, layoutInlineSpacer(unit.Dp(3)))
 			continue
@@ -2656,7 +2914,7 @@ func layoutChatBadge(gtx layout.Context, media *chatMedia) layout.Dimensions {
 	return widget.Image{Src: media.frames[0], Fit: widget.Contain, Position: layout.Center}.Layout(gtx)
 }
 
-func layoutInlineEmote(gtx layout.Context, media *chatMedia, animator *chatAnimator) layout.Dimensions {
+func layoutInlineEmote(gtx layout.Context, media *chatMedia, animator *chatAnimator, emote *hasherino.Emote, hover *emoteHover) layout.Dimensions {
 	src, next := media.frame(animator.now)
 	animator.request(next)
 	height := animator.emoteHeight
@@ -2669,7 +2927,46 @@ func layoutInlineEmote(gtx layout.Context, media *chatMedia, animator *chatAnima
 	}
 	gtx.Constraints.Min = image.Point{}
 	gtx.Constraints.Max = image.Point{X: width, Y: height}
-	return widget.Image{Src: src, Fit: widget.Contain, Position: layout.Center}.Layout(gtx)
+	dims := widget.Image{Src: src, Fit: widget.Contain, Position: layout.Center}.Layout(gtx)
+
+	if emote == nil || hover == nil {
+		return dims
+	}
+	area := clip.Rect{Max: dims.Size}.Push(gtx.Ops)
+	pass := pointer.PassOp{}.Push(gtx.Ops)
+	event.Op(gtx.Ops, hover)
+	pass.Pop()
+	area.Pop()
+
+	for {
+		ev, ok := gtx.Event(pointer.Filter{
+			Target: hover,
+			Kinds:  pointer.Enter | pointer.Leave | pointer.Press | pointer.Cancel,
+		})
+		if !ok {
+			break
+		}
+		e, ok := ev.(pointer.Event)
+		if !ok {
+			continue
+		}
+		switch e.Kind {
+		case pointer.Enter:
+			emoteTooltip.show(emote, hover, e.Source)
+			gtx.Execute(op.InvalidateCmd{})
+		case pointer.Leave:
+			emoteTooltip.hideIf(hover)
+			gtx.Execute(op.InvalidateCmd{})
+		case pointer.Press:
+			emoteTooltip.markPress()
+			emoteTooltip.show(emote, hover, e.Source)
+			gtx.Execute(op.InvalidateCmd{})
+		case pointer.Cancel:
+			emoteTooltip.hideIf(hover)
+			gtx.Execute(op.InvalidateCmd{})
+		}
+	}
+	return dims
 }
 
 // layoutInline lays out widgets like words in a paragraph, wrapping to a new
@@ -4086,6 +4383,9 @@ func run(window *app.Window) error {
 				}),
 				layout.Stacked(func(gtx layout.Context) layout.Dimensions {
 					return layoutSettings(gtx, theme, hc, settings)
+				}),
+				layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+					return emoteTooltip.layout(gtx, theme, window)
 				}),
 			)
 

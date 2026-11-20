@@ -61,6 +61,17 @@ func TestKeyIncludesVersionAndSanitizesIt(t *testing.T) {
 		t.Fatalf("unexpected twitch key: got %q, want %q", got, want)
 	}
 
+	scaled := &hasherino.Emote{Id: "25", Source: hasherino.Twitch, Resolution: "3.0"}
+	if got, want := Key(scaled), "0-25-3.0.img"; got != want {
+		t.Fatalf("unexpected scaled twitch key: got %q, want %q", got, want)
+	}
+
+	scaled = testEmote()
+	scaled.Resolution = "4x"
+	if got, want := Key(scaled), "1-emote-id-v1-4x.gif"; got != want {
+		t.Fatalf("unexpected scaled 7tv key: got %q, want %q", got, want)
+	}
+
 	if got := Key(nil); got != "" {
 		t.Errorf("expected no key for a nil emote, got %q", got)
 	}

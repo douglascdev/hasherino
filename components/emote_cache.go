@@ -375,6 +375,9 @@ func emoteCacheKey(emote *hasherino.Emote) string {
 	if emote.Version != "" {
 		key += "-" + emote.Version
 	}
+	if emote.Resolution != "" {
+		key += "-" + emote.Resolution
+	}
 	return key + extension
 }
 
