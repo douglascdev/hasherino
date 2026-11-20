@@ -1233,15 +1233,20 @@ func (hc *HasherinoController) IsChannelJoined(channel string) bool {
 }
 
 func (hc *HasherinoController) SendMessage(channel string, message string) error {
+	return hc.SendReply(channel, message, "")
+}
+
+// SendReply sends a chat message that replies to the message with replyID.
+func (hc *HasherinoController) SendReply(channel string, message string, replyID string) error {
 	ws := hc.writeSocket()
 	if ws == nil {
 		return ErrNotConnected
 	}
-	if err := ws.Send(channel, message); err != nil {
+	if err := ws.SendReply(channel, message, replyID); err != nil {
 		// the socket may have been replaced by a reconnect between reading
 		// the pointer and writing; retry once on the new connection
 		if current := hc.writeSocket(); current != nil && current != ws && current.IsConnected() {
-			return current.Send(channel, message)
+			return current.SendReply(channel, message, replyID)
 		}
 		return err
 	}

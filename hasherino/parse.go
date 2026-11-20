@@ -15,15 +15,21 @@ type Badge struct {
 }
 
 type ChatMessage struct {
-	Channel     string
-	Command     string
-	Id          string // twitch message id from the irc tags, empty when unset
-	Author      string
-	AuthorColor string // hex color of the author's name from the irc tags, empty when unset
-	Text        string
-	Time        time.Time
-	Emotes      map[string]*Emote // twitch emotes of the message from the irc emotes tag, keyed by name
-	Badges      []Badge           // badges of the author from the irc badges tag, in display order
+	Channel string
+	Command string
+	Id      string // twitch message id from the irc tags, empty when unset
+	// ReplyParent* describe the message this one replies to, from the
+	// reply-parent tags twitch adds to a reply.
+	ReplyParentID     string
+	ReplyParentLogin  string
+	ReplyParentAuthor string
+	ReplyParentText   string
+	Author            string
+	AuthorColor       string // hex color of the author's name from the irc tags, empty when unset
+	Text              string
+	Time              time.Time
+	Emotes            map[string]*Emote // twitch emotes of the message from the irc emotes tag, keyed by name
+	Badges            []Badge           // badges of the author from the irc badges tag, in display order
 }
 
 func ParseMessage(message string) (*ChatMessage, error) {
@@ -49,16 +55,24 @@ func ParseMessage(message string) (*ChatMessage, error) {
 			sentAt = time.UnixMilli(millis)
 		}
 	}
+	replyAuthor := msg.Tags["reply-parent-display-name"]
+	if replyAuthor == "" {
+		replyAuthor = msg.Tags["reply-parent-user-login"]
+	}
 	return &ChatMessage{
-		Channel:     channel,
-		Command:     msg.Command,
-		Id:          msg.Tags["id"],
-		Author:      msg.Name,
-		AuthorColor: msg.Tags["color"],
-		Text:        paramsText,
-		Time:        sentAt,
-		Emotes:      parseTagEmotes(msg.Tags["emotes"], paramsText),
-		Badges:      parseTagBadges(msg.Tags["badges"]),
+		Channel:           channel,
+		Command:           msg.Command,
+		Id:                msg.Tags["id"],
+		ReplyParentID:     msg.Tags["reply-parent-msg-id"],
+		ReplyParentLogin:  msg.Tags["reply-parent-user-login"],
+		ReplyParentAuthor: replyAuthor,
+		ReplyParentText:   msg.Tags["reply-parent-msg-body"],
+		Author:            msg.Name,
+		AuthorColor:       msg.Tags["color"],
+		Text:              paramsText,
+		Time:              sentAt,
+		Emotes:            parseTagEmotes(msg.Tags["emotes"], paramsText),
+		Badges:            parseTagBadges(msg.Tags["badges"]),
 	}, nil
 
 }

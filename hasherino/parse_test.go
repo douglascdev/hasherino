@@ -69,6 +69,34 @@ func TestParseMessageExtractsMessageId(t *testing.T) {
 	}
 }
 
+func TestParseMessageExtractsReplyParent(t *testing.T) {
+	message := `@id=child;reply-parent-msg-id=parent;reply-parent-user-login=alice;reply-parent-display-name=Alice;reply-parent-msg-body=hello\sworld :bob!bob@bob.tmi.twitch.tv PRIVMSG #channel :reply`
+	msg, err := ParseMessage(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.ReplyParentID != "parent" {
+		t.Errorf("unexpected reply id: %q", msg.ReplyParentID)
+	}
+	if msg.ReplyParentLogin != "alice" {
+		t.Errorf("unexpected reply login: %q", msg.ReplyParentLogin)
+	}
+	if msg.ReplyParentAuthor != "Alice" {
+		t.Errorf("unexpected reply author: %q", msg.ReplyParentAuthor)
+	}
+	if msg.ReplyParentText != "hello world" {
+		t.Errorf("unexpected reply text: %q", msg.ReplyParentText)
+	}
+
+	msg, err = ParseMessage(`@tmi-sent-ts=1700000000000 :user!user@user.tmi.twitch.tv PRIVMSG #channel :hello`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.ReplyParentID != "" || msg.ReplyParentAuthor != "" || msg.ReplyParentText != "" {
+		t.Errorf("expected no reply fields, got %+v", msg)
+	}
+}
+
 func TestParseMessageExtractsTagBadges(t *testing.T) {
 	tests := []struct {
 		name    string

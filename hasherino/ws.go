@@ -561,3 +561,15 @@ func (w *TwitchChatWebsocket) Part(channel string) error {
 func (w *TwitchChatWebsocket) Send(channel string, message string) error {
 	return w.send("PRIVMSG #" + channel + " :" + message)
 }
+
+// SendReply sends a chat message that replies to the message with replyID.
+// An empty replyID sends a normal message.
+func (w *TwitchChatWebsocket) SendReply(channel string, message string, replyID string) error {
+	if replyID == "" {
+		return w.Send(channel, message)
+	}
+	if strings.ContainsAny(replyID, " \r\n;") {
+		return errors.New("invalid reply message id")
+	}
+	return w.send("@reply-parent-msg-id=" + replyID + " PRIVMSG #" + channel + " :" + message)
+}

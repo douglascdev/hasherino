@@ -86,9 +86,11 @@ func (p *chatPart) linkButton(url string) *widget.Clickable {
 // chatMessageMenu holds the persistent click state for a message's actions
 // menu. One menu is shared by all copies of a message made during layout.
 type chatMessageMenu struct {
-	copyButton     widget.Clickable
-	copyFullButton widget.Clickable
-	panel          widget.Clickable
+	replyButton     widget.Clickable
+	replyJumpButton widget.Clickable
+	copyButton      widget.Clickable
+	copyFullButton  widget.Clickable
+	panel           widget.Clickable
 	// touch long press state: the menu opens after the finger stays on the
 	// message long enough without turning into a scroll.
 	pressPending bool
@@ -112,6 +114,11 @@ type chatMessage struct {
 	authorColor color.NRGBA
 	text        string
 	sentAt      time.Time
+	// replyID, replyAuthor and replyText describe the message this one
+	// replies to.
+	replyID     string
+	replyAuthor string
+	replyText   string
 	media       *chatMedia
 	parts       []chatPart
 	// ownEmotes are the emotes the message itself carries from its irc tags,
@@ -178,6 +185,22 @@ type chat struct {
 	seenOrder []string
 	// historyLoaded reports whether the initial history request finished.
 	historyLoaded bool
+	// reply is the message the composer is replying to, nil when not
+	// replying.
+	reply *replyTarget
+	// replyFocus asks the composer to focus after a reply was selected.
+	replyFocus bool
+	// focusedID is a message briefly highlighted after jumping to it, for
+	// example through a reply label.
+	focusedID  string
+	focusUntil time.Time
+}
+
+// replyTarget is the snapshot of a message needed to compose a reply.
+type replyTarget struct {
+	id     string
+	author string
+	text   string
 }
 
 const (
@@ -204,6 +227,9 @@ const (
 	// chatLongPressSlop is how far a touch may move before the long press is
 	// cancelled in favor of scrolling.
 	chatLongPressSlop = unit.Dp(8)
+	// chatReplyFocusDuration is how long a jumped-to message stays
+	// highlighted.
+	chatReplyFocusDuration = 2 * time.Second
 
 	// resumeCheckInterval and resumeGapThreshold detect that the app was
 	// suspended: the ticker keeps running while the process is scheduled, so
@@ -285,6 +311,33 @@ func (c *chat) appendLocked(message chatMessage) {
 	c.trackMessageLocked(message)
 }
 
+// stripReplyMention removes the @user prefix that some clients put at the
+// start of a reply body. The reply line above the message already names the
+// user, so the body should start with the actual message.
+func stripReplyMention(text, login, displayName string) string {
+	mentions := make([]string, 0, 2)
+	if login != "" {
+		mentions = append(mentions, login)
+	}
+	if displayName != "" && !strings.ContainsAny(displayName, " \t") && !strings.EqualFold(displayName, login) {
+		mentions = append(mentions, displayName)
+	}
+
+	trimmed := strings.TrimLeft(text, " \t")
+	for _, mention := range mentions {
+		prefix := "@" + mention
+		if len(trimmed) < len(prefix) || !strings.EqualFold(trimmed[:len(prefix)], prefix) {
+			continue
+		}
+		rest := trimmed[len(prefix):]
+		if rest != "" && rest[0] != ' ' && rest[0] != '\t' && rest[0] != '\n' && rest[0] != '\r' {
+			continue
+		}
+		return strings.TrimLeft(rest, " \t")
+	}
+	return text
+}
+
 // appendLive adds a message that arrived on the live connection.
 func (c *chat) appendLive(message hasherino.ChatMessage) bool {
 	if !shouldRenderChatMessage(message) {
@@ -299,8 +352,11 @@ func (c *chat) appendLive(message hasherino.ChatMessage) bool {
 		id:          message.Id,
 		author:      message.Author,
 		authorColor: parseHexColor(message.AuthorColor),
-		text:        message.Text,
+		text:        stripReplyMention(message.Text, message.ReplyParentLogin, message.ReplyParentAuthor),
 		sentAt:      message.Time,
+		replyID:     message.ReplyParentID,
+		replyAuthor: message.ReplyParentAuthor,
+		replyText:   message.ReplyParentText,
 		ownEmotes:   message.Emotes,
 		rawBadges:   message.Badges,
 	})
@@ -342,8 +398,11 @@ func (c *chat) appendHistory(messages []hasherino.ChatMessage, cursor time.Time)
 			seq:         c.nextSeq,
 			author:      message.Author,
 			authorColor: parseHexColor(message.AuthorColor),
-			text:        message.Text,
+			text:        stripReplyMention(message.Text, message.ReplyParentLogin, message.ReplyParentAuthor),
 			sentAt:      message.Time,
+			replyID:     message.ReplyParentID,
+			replyAuthor: message.ReplyParentAuthor,
+			replyText:   message.ReplyParentText,
 			ownEmotes:   message.Emotes,
 			rawBadges:   message.Badges,
 		}
@@ -410,6 +469,32 @@ func (c *chat) hasSeenLocked(id string) bool {
 	}
 	_, ok := c.seenIDs[id]
 	return ok
+}
+
+// focusMessage scrolls to the message with id and highlights it briefly.
+func (c *chat) focusMessage(id string) {
+	if id == "" {
+		return
+	}
+	c.mu.Lock()
+	index := -1
+	for i := range c.messages {
+		if c.messages[i].id == id {
+			index = i
+			break
+		}
+	}
+	if index >= 0 {
+		// do not let a pending follow-the-end request undo the jump
+		c.scrollToEnd = false
+	}
+	c.mu.Unlock()
+	if index < 0 {
+		return
+	}
+	c.list.ScrollTo(index)
+	c.focusedID = id
+	c.focusUntil = time.Now().Add(chatReplyFocusDuration)
 }
 
 // backfillCursor returns the newest message timestamp, the point new history
@@ -675,6 +760,8 @@ type emoteSuggestionRow struct {
 type messageInputState struct {
 	editor       widget.Editor
 	sendButton   widget.Clickable
+	cancelReply  widget.Clickable
+	replyJump    widget.Clickable
 	suggestions  []*hasherino.Emote
 	rows         []emoteSuggestionRow
 	selected     int
@@ -818,7 +905,7 @@ func (s *messageInputState) completeTab(gtx layout.Context, hc *hasherino.Hasher
 	gtx.Execute(key.FocusCmd{Tag: &s.editor})
 }
 
-func (s *messageInputState) send(gtx layout.Context, hc *hasherino.HasherinoController, selectedLogin string) {
+func (s *messageInputState) send(gtx layout.Context, hc *hasherino.HasherinoController, selectedLogin string, selectedChat *chat) {
 	if selectedLogin == "" {
 		return
 	}
@@ -830,11 +917,18 @@ func (s *messageInputState) send(gtx layout.Context, hc *hasherino.HasherinoCont
 		s.errText = "Message too long"
 		return
 	}
-	if err := hc.SendMessage(selectedLogin, text); err != nil {
+	replyID := ""
+	if selectedChat != nil && selectedChat.reply != nil {
+		replyID = selectedChat.reply.id
+	}
+	if err := hc.SendReply(selectedLogin, text, replyID); err != nil {
 		s.errText = err.Error()
 		return
 	}
 	s.errText = ""
+	if selectedChat != nil {
+		selectedChat.reply = nil
+	}
 	s.hideSuggestions()
 	s.setText("")
 	gtx.Execute(key.FocusCmd{Tag: &s.editor})
@@ -1398,27 +1492,99 @@ func replaceToken(text string, tokenStart, tokenEnd int, replacement string) (st
 	return string(replaced), tokenStart + len(replacementRunes)
 }
 
-func layoutMessageInput(gtx layout.Context, theme *material.Theme, state *messageInputState, hc *hasherino.HasherinoController, window *app.Window, selectedLogin string) layout.Dimensions {
+func layoutMessageInput(gtx layout.Context, theme *material.Theme, state *messageInputState, hc *hasherino.HasherinoController, window *app.Window, selectedLogin string, selectedChat *chat, closeIcon *widget.Icon) layout.Dimensions {
 	state.drainSearchEvents()
-	state.handleInputKeys(gtx, hc, selectedLogin)
+	state.handleInputKeys(gtx, hc, selectedLogin, selectedChat)
 	state.updateSearch(gtx, window, hc)
 
-	var inputDims layout.Dimensions
-	return layout.Stack{Alignment: layout.S}.Layout(gtx,
-		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
-			inputDims = layoutMessageInputRow(gtx, theme, state, hc, selectedLogin)
-			return inputDims
+	if selectedChat != nil && selectedChat.reply != nil && state.cancelReply.Clicked(gtx) {
+		selectedChat.reply = nil
+		gtx.Execute(key.FocusCmd{Tag: &state.editor})
+		gtx.Execute(op.InvalidateCmd{})
+	}
+	if selectedChat != nil && selectedChat.replyFocus {
+		selectedChat.replyFocus = false
+		gtx.Execute(key.FocusCmd{Tag: &state.editor})
+	}
+
+	input := func(gtx layout.Context) layout.Dimensions {
+		var inputDims layout.Dimensions
+		return layout.Stack{Alignment: layout.S}.Layout(gtx,
+			layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+				inputDims = layoutMessageInputRow(gtx, theme, state, hc, selectedLogin, selectedChat)
+				return inputDims
+			}),
+			layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+				if !state.visible || len(state.suggestions) == 0 {
+					return layout.Dimensions{}
+				}
+				offset := op.Offset(image.Pt(0, -(inputDims.Size.Y + gtx.Dp(unit.Dp(8))))).Push(gtx.Ops)
+				dims := layoutEmoteSuggestions(gtx, theme, state, window)
+				offset.Pop()
+				return dims
+			}),
+		)
+	}
+
+	if selectedChat == nil || selectedChat.reply == nil {
+		return input(gtx)
+	}
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layoutReplyIndicator(gtx, theme, state, selectedChat, selectedChat.reply, closeIcon)
 		}),
-		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
-			if !state.visible || len(state.suggestions) == 0 {
-				return layout.Dimensions{}
-			}
-			offset := op.Offset(image.Pt(0, -(inputDims.Size.Y + gtx.Dp(unit.Dp(8))))).Push(gtx.Ops)
-			dims := layoutEmoteSuggestions(gtx, theme, state, window)
-			offset.Pop()
-			return dims
-		}),
+		layout.Rigid(input),
 	)
+}
+
+// layoutReplyIndicator shows the message being replied to above the composer,
+// with a button to cancel the reply.
+func layoutReplyIndicator(gtx layout.Context, theme *material.Theme, state *messageInputState, selectedChat *chat, reply *replyTarget, closeIcon *widget.Icon) layout.Dimensions {
+	if selectedChat != nil && state.replyJump.Clicked(gtx) {
+		selectedChat.focusMessage(reply.id)
+		gtx.Execute(op.InvalidateCmd{})
+	}
+	return layout.Inset{Top: unit.Dp(4), Bottom: unit.Dp(4), Left: unit.Dp(12), Right: unit.Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				children := []layout.FlexChild{
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						label := material.Body2(theme, "Replying to @"+reply.author)
+						label.Color = theme.ContrastBg
+						label.MaxLines = 1
+						if state.replyJump.Hovered() {
+							label.Color.A = 0xff
+						}
+						return label.Layout(gtx)
+					}),
+				}
+				if reply.text != "" {
+					children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						label := material.Caption(theme, reply.text)
+						label.Color = theme.Fg
+						label.Color.A = 0x99
+						label.MaxLines = 1
+						return label.Layout(gtx)
+					}))
+				}
+				return state.replyJump.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					pointer.CursorPointer.Add(gtx.Ops)
+					return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+				})
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				if closeIcon == nil {
+					return layout.Dimensions{}
+				}
+				style := material.IconButton(theme, &state.cancelReply, closeIcon, "Cancel reply")
+				style.Background = color.NRGBA{}
+				style.Color = theme.Fg
+				style.Size = 16
+				style.Inset = layout.UniformInset(2)
+				return style.Layout(gtx)
+			}),
+		)
+	})
 }
 
 func (s *messageInputState) updateSearch(gtx layout.Context, window *app.Window, hc *hasherino.HasherinoController) {
@@ -1437,18 +1603,18 @@ func (s *messageInputState) updateSearch(gtx layout.Context, window *app.Window,
 	s.scheduleSearch(window, hc, query)
 }
 
-func (s *messageInputState) handleInputKeys(gtx layout.Context, hc *hasherino.HasherinoController, selectedLogin string) {
-	s.handleInputKey(gtx, key.NameReturn, hc, selectedLogin)
-	s.handleInputKey(gtx, key.NameEnter, hc, selectedLogin)
-	s.handleInputKey(gtx, key.NameTab, hc, selectedLogin)
+func (s *messageInputState) handleInputKeys(gtx layout.Context, hc *hasherino.HasherinoController, selectedLogin string, selectedChat *chat) {
+	s.handleInputKey(gtx, key.NameReturn, hc, selectedLogin, selectedChat)
+	s.handleInputKey(gtx, key.NameEnter, hc, selectedLogin, selectedChat)
+	s.handleInputKey(gtx, key.NameTab, hc, selectedLogin, selectedChat)
 	if s.visible {
-		s.handleInputKey(gtx, key.NameUpArrow, hc, selectedLogin)
-		s.handleInputKey(gtx, key.NameDownArrow, hc, selectedLogin)
-		s.handleInputKey(gtx, key.NameEscape, hc, selectedLogin)
+		s.handleInputKey(gtx, key.NameUpArrow, hc, selectedLogin, selectedChat)
+		s.handleInputKey(gtx, key.NameDownArrow, hc, selectedLogin, selectedChat)
+		s.handleInputKey(gtx, key.NameEscape, hc, selectedLogin, selectedChat)
 	}
 }
 
-func (s *messageInputState) handleInputKey(gtx layout.Context, name key.Name, hc *hasherino.HasherinoController, selectedLogin string) {
+func (s *messageInputState) handleInputKey(gtx layout.Context, name key.Name, hc *hasherino.HasherinoController, selectedLogin string, selectedChat *chat) {
 	for {
 		event, ok := gtx.Event(key.Filter{Focus: &s.editor, Name: name})
 		if !ok {
@@ -1464,7 +1630,7 @@ func (s *messageInputState) handleInputKey(gtx layout.Context, name key.Name, hc
 			if s.visible && len(s.suggestions) > 0 {
 				s.acceptSelected(gtx)
 			} else {
-				s.send(gtx, hc, selectedLogin)
+				s.send(gtx, hc, selectedLogin, selectedChat)
 			}
 		case key.NameTab:
 			if s.visible && len(s.suggestions) > 0 {
@@ -1486,9 +1652,9 @@ func (s *messageInputState) handleInputKey(gtx layout.Context, name key.Name, hc
 	}
 }
 
-func layoutMessageInputRow(gtx layout.Context, theme *material.Theme, state *messageInputState, hc *hasherino.HasherinoController, selectedLogin string) layout.Dimensions {
+func layoutMessageInputRow(gtx layout.Context, theme *material.Theme, state *messageInputState, hc *hasherino.HasherinoController, selectedLogin string, selectedChat *chat) layout.Dimensions {
 	if state.sendButton.Clicked(gtx) {
-		state.send(gtx, hc, selectedLogin)
+		state.send(gtx, hc, selectedLogin, selectedChat)
 	}
 
 	return layout.Inset{
@@ -2313,6 +2479,10 @@ type chatAnimator struct {
 	emoteHeight int
 	// menu tracks the currently open message actions menu.
 	menu *chatMessageMenuState
+	// focusedID is the message to highlight and focusMessage jumps to a
+	// message in the chat.
+	focusedID    string
+	focusMessage func(string)
 }
 
 func (a *chatAnimator) request(next time.Time) {
@@ -2337,11 +2507,21 @@ func (a *chatAnimator) invalidate(gtx layout.Context) {
 }
 
 func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensions {
+	focusedID := c.focusedID
+	if focusedID != "" && !time.Now().Before(c.focusUntil) {
+		c.focusedID = ""
+		focusedID = ""
+	}
 	animator := chatAnimator{
-		now:         time.Now(),
-		showTime:    c.showTime,
-		emoteHeight: gtx.Dp(c.emoteSize),
-		menu:        &c.menu,
+		now:          time.Now(),
+		showTime:     c.showTime,
+		emoteHeight:  gtx.Dp(c.emoteSize),
+		menu:         &c.menu,
+		focusedID:    focusedID,
+		focusMessage: c.focusMessage,
+	}
+	if focusedID != "" {
+		gtx.Execute(op.InvalidateCmd{At: c.focusUntil})
 	}
 	messages, version := c.snapshotState()
 	dragging := c.list.List.Dragging() || c.list.Scrollbar.Dragging()
@@ -2438,7 +2618,21 @@ func (c *chat) updateScrollState(messages []chatMessage, version uint64, nearBot
 
 func layoutChatMessage(gtx layout.Context, theme *material.Theme, message chatMessage, animator *chatAnimator) layout.Dimensions {
 	content := func(gtx layout.Context) layout.Dimensions {
-		return layoutChatMessageContent(gtx, theme, message, animator)
+		if message.replyAuthor == "" {
+			return layoutChatMessageContent(gtx, theme, message, animator)
+		}
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				var button *widget.Clickable
+				if message.menu != nil {
+					button = &message.menu.replyJumpButton
+				}
+				return layoutChatReplyLine(gtx, theme, message.replyAuthor, message.replyText, button, animator, message.replyID)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layoutChatMessageContent(gtx, theme, message, animator)
+			}),
+		)
 	}
 
 	// Measure and record the content. The right-click handler is added after
@@ -2539,6 +2733,16 @@ func layoutChatMessage(gtx layout.Context, theme *material.Theme, message chatMe
 	}
 
 	drawContent := func(gtx layout.Context) layout.Dimensions {
+		if animator != nil && animator.focusedID != "" && message.id == animator.focusedID {
+			width := gtx.Constraints.Max.X
+			if width <= 0 {
+				width = dims.Size.X
+			}
+			area := image.Rectangle{Max: image.Point{X: width, Y: dims.Size.Y}}
+			highlight := color.NRGBA{R: 0x2a, G: 0x4a, B: 0x70, A: 0x66}
+			radius := gtx.Dp(unit.Dp(4))
+			paint.FillShape(gtx.Ops, highlight, clip.UniformRRect(area, radius).Op(gtx.Ops))
+		}
 		call.Add(gtx.Ops)
 		if handlerEnabled {
 			area := dims.Size
@@ -2555,6 +2759,42 @@ func layoutChatMessage(gtx layout.Context, theme *material.Theme, message chatMe
 	}
 
 	return drawContent(gtx)
+}
+
+// layoutChatReplyLine shows the message this one replies to in a smaller,
+// dimmer line above the message itself. Clicking it jumps to the parent
+// message.
+func layoutChatReplyLine(gtx layout.Context, theme *material.Theme, author, text string, button *widget.Clickable, animator *chatAnimator, replyID string) layout.Dimensions {
+	line := "Replying to @" + author
+	if text != "" {
+		line += ": " + text
+	}
+	label := material.Body2(theme, line)
+	label.Color = theme.Fg
+	label.Color.A = 0x88
+	if button != nil && button.Hovered() {
+		label.Color.A = 0xd0
+	}
+	label.MaxLines = 1
+
+	draw := func(gtx layout.Context) layout.Dimensions {
+		return label.Layout(gtx)
+	}
+	if button == nil {
+		return layout.Inset{Bottom: unit.Dp(2)}.Layout(gtx, draw)
+	}
+	if button.Clicked(gtx) {
+		if animator != nil && animator.focusMessage != nil {
+			animator.focusMessage(replyID)
+		}
+		gtx.Execute(op.InvalidateCmd{})
+	}
+	return layout.Inset{Bottom: unit.Dp(2)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return button.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			pointer.CursorPointer.Add(gtx.Ops)
+			return draw(gtx)
+		})
+	})
 }
 
 func layoutChatMessageContent(gtx layout.Context, theme *material.Theme, message chatMessage, animator *chatAnimator) layout.Dimensions {
@@ -2718,6 +2958,14 @@ func (c *chat) layoutMenuOverlay(gtx layout.Context, theme *material.Theme, mess
 		return
 	}
 
+	if menu.replyButton.Clicked(gtx) {
+		message := c.menu.message
+		c.reply = &replyTarget{id: message.id, author: message.author, text: message.text}
+		c.replyFocus = true
+		c.menu.open = nil
+		gtx.Execute(op.InvalidateCmd{})
+		return
+	}
 	if menu.copyButton.Clicked(gtx) {
 		c.writeClipboard(gtx, c.menu.message.text)
 		c.menu.open = nil
@@ -2838,6 +3086,9 @@ func layoutChatMenuPanel(gtx layout.Context, theme *material.Theme, state *chatM
 	content := func(gtx layout.Context) layout.Dimensions {
 		return layout.UniformInset(unit.Dp(4)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layoutChatMenuItem(gtx, theme, &menu.replyButton, "Reply")
+				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return layoutChatMenuItem(gtx, theme, &menu.copyButton, "Copy message")
 				}),
@@ -4404,8 +4655,10 @@ func run(window *app.Window) error {
 			toolbar = append(toolbar, addStyle.Layout)
 
 			selectedLogin := ""
+			var selectedChat *chat
 			if selectedTab >= 0 && selectedTab < len(tabs) {
 				selectedLogin = tabs[selectedTab].login
+				selectedChat = tabs[selectedTab].chat
 			}
 
 			// Draw the toolbar, chat, message input, and overlays.
@@ -4425,7 +4678,7 @@ func run(window *app.Window) error {
 							return tabs[selectedTab].chat.layout(gtx, theme)
 						}),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							return layoutMessageInput(gtx, theme, messageInput, hc, window, selectedLogin)
+							return layoutMessageInput(gtx, theme, messageInput, hc, window, selectedLogin, selectedChat, closeIcon)
 						}),
 					)
 				}),
