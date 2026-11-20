@@ -1433,10 +1433,8 @@ func layoutMessageInputRow(gtx layout.Context, theme *material.Theme, state *mes
 	}
 
 	return layout.Inset{
-		Top:    unit.Dp(8),
-		Bottom: unit.Dp(8),
-		Left:   unit.Dp(12),
-		Right:  unit.Dp(12),
+		Left:  unit.Dp(12),
+		Right: unit.Dp(12),
 	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
@@ -2039,10 +2037,8 @@ func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensio
 	}
 	c.list.Gap = gtx.Dp(unit.Dp(8))
 	dims := layout.Inset{
-		Top:    unit.Dp(8),
-		Bottom: unit.Dp(8),
-		Left:   unit.Dp(12),
-		Right:  unit.Dp(12),
+		Left:  unit.Dp(12),
+		Right: unit.Dp(12),
 	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		heights := make(map[int]int)
 		dims := material.List(theme, &c.list).Layout(gtx, len(messages), func(gtx layout.Context, index int) layout.Dimensions {
@@ -3950,7 +3946,6 @@ func run(window *app.Window) error {
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 							return layoutFlow(gtx, unit.Dp(4), unit.Dp(4), toolbar...)
 						}),
-						layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
 						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 							if selectedTab < 0 || selectedTab >= len(tabs) || tabs[selectedTab].chat == nil {
 								return layout.Dimensions{}
