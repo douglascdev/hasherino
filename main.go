@@ -1492,7 +1492,7 @@ func replaceToken(text string, tokenStart, tokenEnd int, replacement string) (st
 	return string(replaced), tokenStart + len(replacementRunes)
 }
 
-func layoutMessageInput(gtx layout.Context, theme *material.Theme, state *messageInputState, hc *hasherino.HasherinoController, window *app.Window, selectedLogin string, selectedChat *chat, closeIcon *widget.Icon) layout.Dimensions {
+func layoutMessageInput(gtx layout.Context, theme *material.Theme, state *messageInputState, hc *hasherino.HasherinoController, window *app.Window, selectedLogin string, selectedChat *chat, closeIcon, sendIcon *widget.Icon) layout.Dimensions {
 	state.drainSearchEvents()
 	state.handleInputKeys(gtx, hc, selectedLogin, selectedChat)
 	state.updateSearch(gtx, window, hc)
@@ -1511,7 +1511,7 @@ func layoutMessageInput(gtx layout.Context, theme *material.Theme, state *messag
 		var inputDims layout.Dimensions
 		return layout.Stack{Alignment: layout.S}.Layout(gtx,
 			layout.Stacked(func(gtx layout.Context) layout.Dimensions {
-				inputDims = layoutMessageInputRow(gtx, theme, state, hc, selectedLogin, selectedChat)
+				inputDims = layoutMessageInputRow(gtx, theme, state, hc, selectedLogin, selectedChat, sendIcon)
 				return inputDims
 			}),
 			layout.Stacked(func(gtx layout.Context) layout.Dimensions {
@@ -1652,7 +1652,7 @@ func (s *messageInputState) handleInputKey(gtx layout.Context, name key.Name, hc
 	}
 }
 
-func layoutMessageInputRow(gtx layout.Context, theme *material.Theme, state *messageInputState, hc *hasherino.HasherinoController, selectedLogin string, selectedChat *chat) layout.Dimensions {
+func layoutMessageInputRow(gtx layout.Context, theme *material.Theme, state *messageInputState, hc *hasherino.HasherinoController, selectedLogin string, selectedChat *chat, sendIcon *widget.Icon) layout.Dimensions {
 	if state.sendButton.Clicked(gtx) {
 		state.send(gtx, hc, selectedLogin, selectedChat)
 	}
@@ -1669,7 +1669,12 @@ func layoutMessageInputRow(gtx layout.Context, theme *material.Theme, state *mes
 			}),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return material.Button(theme, &state.sendButton, "Send").Layout(gtx)
+				style := material.IconButton(theme, &state.sendButton, sendIcon, "Send message")
+				style.Background = theme.ContrastBg
+				style.Color = theme.ContrastFg
+				style.Size = 20
+				style.Inset = layout.UniformInset(6)
+				return style.Layout(gtx)
 			}),
 		)
 	})
@@ -4522,6 +4527,10 @@ func run(window *app.Window) error {
 	if err != nil {
 		return err
 	}
+	sendIcon, err := widget.NewIcon(icons.ContentSend)
+	if err != nil {
+		return err
+	}
 
 	addButton := new(widget.Clickable)
 	addIcon, err := widget.NewIcon(icons.ContentAdd)
@@ -4678,7 +4687,7 @@ func run(window *app.Window) error {
 							return tabs[selectedTab].chat.layout(gtx, theme)
 						}),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							return layoutMessageInput(gtx, theme, messageInput, hc, window, selectedLogin, selectedChat, closeIcon)
+							return layoutMessageInput(gtx, theme, messageInput, hc, window, selectedLogin, selectedChat, closeIcon, sendIcon)
 						}),
 					)
 				}),
