@@ -17,6 +17,7 @@ type Badge struct {
 type ChatMessage struct {
 	Channel     string
 	Command     string
+	Id          string // twitch message id from the irc tags, empty when unset
 	Author      string
 	AuthorColor string // hex color of the author's name from the irc tags, empty when unset
 	Text        string
@@ -51,6 +52,7 @@ func ParseMessage(message string) (*ChatMessage, error) {
 	return &ChatMessage{
 		Channel:     channel,
 		Command:     msg.Command,
+		Id:          msg.Tags["id"],
 		Author:      msg.Name,
 		AuthorColor: msg.Tags["color"],
 		Text:        paramsText,

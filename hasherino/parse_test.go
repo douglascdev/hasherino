@@ -50,6 +50,25 @@ func TestParseMessageExtractsTheAuthorColor(t *testing.T) {
 	}
 }
 
+func TestParseMessageExtractsMessageId(t *testing.T) {
+	message := `@id=abc-123;tmi-sent-ts=1700000000000 :user!user@user.tmi.twitch.tv PRIVMSG #channel :hello`
+	msg, err := ParseMessage(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Id != "abc-123" {
+		t.Errorf("expected the message id, got %q", msg.Id)
+	}
+
+	msg, err = ParseMessage(`@tmi-sent-ts=1700000000000 :user!user@user.tmi.twitch.tv PRIVMSG #channel :hello`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Id != "" {
+		t.Errorf("expected no message id, got %q", msg.Id)
+	}
+}
+
 func TestParseMessageExtractsTagBadges(t *testing.T) {
 	tests := []struct {
 		name    string

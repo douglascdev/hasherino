@@ -20,6 +20,14 @@ used for 30 days are removed, and the cache is capped at 512 MiB. Cached files
 are revalidated in the background when their emote list loads. Set
 `HASHERINO_CACHE_DIR` to use a different folder.
 
+## Chat history and resume
+
+When the app is suspended — Android background restrictions, Doze, or a
+sleeping laptop — the chat connection is dropped and Twitch IRC does not
+replay missed messages. On resume (and after a reconnect) the app fetches the
+recent messages of the open channels and merges the missing ones, using the
+message ids to avoid duplicates. This requires the Chat history setting.
+
 ## Account tokens
 
 Accounts added through Twitch's device-code flow keep their refresh token and

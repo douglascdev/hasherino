@@ -84,7 +84,7 @@ func TestWebsocketAnswersPing(t *testing.T) {
 	})
 
 	ws := newTestWebsocket(t, server)
-	ws.StartListening(nil, nil)
+	ws.StartListening(nil, nil, nil)
 
 	select {
 	case got := <-pong:
@@ -114,11 +114,14 @@ func TestWebsocketReconnectsAfterConnectionDrop(t *testing.T) {
 	})
 
 	ws := newTestWebsocket(t, server)
+	reconnected := make(chan struct{}, 1)
 	ws.StartListening(func(message string) {
 		if strings.Contains(message, "PRIVMSG") {
 			messages <- message
 		}
-	}, nil)
+	}, nil, func() {
+		reconnected <- struct{}{}
+	})
 
 	select {
 	case message := <-messages:
@@ -130,6 +133,11 @@ func TestWebsocketReconnectsAfterConnectionDrop(t *testing.T) {
 	}
 	if connections.Load() < 2 {
 		t.Errorf("expected a reconnect, got %d connections", connections.Load())
+	}
+	select {
+	case <-reconnected:
+	case <-time.After(time.Second):
+		t.Error("expected the reconnect handler to be called")
 	}
 }
 
@@ -143,7 +151,7 @@ func TestWebsocketReportsAuthenticationFailure(t *testing.T) {
 	authFailed := make(chan struct{}, 1)
 	ws.StartListening(nil, func() {
 		authFailed <- struct{}{}
-	})
+	}, nil)
 
 	select {
 	case <-authFailed:
@@ -185,7 +193,7 @@ func TestWebsocketRejoinsChannelsAfterReconnect(t *testing.T) {
 	if err := ws.Join("channel"); err != nil {
 		t.Fatalf("failed to join the channel: %s", err)
 	}
-	ws.StartListening(nil, nil)
+	ws.StartListening(nil, nil, nil)
 
 	select {
 	case line := <-rejoined:

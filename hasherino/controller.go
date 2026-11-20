@@ -50,6 +50,10 @@ type HasherinoController struct {
 	// changed emotes, so the image cache can update its files.
 	emoteRefreshLock sync.RWMutex
 	emoteRefreshHook func([]*Emote)
+	// chatReconnectHook is notified when the reading socket reconnects after
+	// a drop, so the chat can fetch the messages it missed.
+	chatReconnectLock sync.RWMutex
+	chatReconnectHook func()
 }
 
 const (
@@ -655,6 +659,24 @@ func dedupeEmotes(emotes []Emote) []Emote {
 	return result
 }
 
+// SetChatReconnectHook sets the function notified when the chat reader
+// reconnects after a connection loss. It is called from the listener
+// goroutine.
+func (hc *HasherinoController) SetChatReconnectHook(hook func()) {
+	hc.chatReconnectLock.Lock()
+	defer hc.chatReconnectLock.Unlock()
+	hc.chatReconnectHook = hook
+}
+
+func (hc *HasherinoController) notifyChatReconnected() {
+	hc.chatReconnectLock.RLock()
+	hook := hc.chatReconnectHook
+	hc.chatReconnectLock.RUnlock()
+	if hook != nil {
+		hook()
+	}
+}
+
 // sameEmote reports whether a refreshed emote still describes the same
 // emote, so its cached file and rendering do not need to be updated.
 func sameEmote(a, b *Emote) bool {
@@ -1028,7 +1050,7 @@ func (hc *HasherinoController) connectWriteSocket() error {
 	if old != nil {
 		old.Close()
 	}
-	ws.StartListening(nil, hc.handleWriteAuthError)
+	ws.StartListening(nil, hc.handleWriteAuthError, nil)
 	return nil
 }
 
@@ -1125,6 +1147,9 @@ func (hc *HasherinoController) handleWriteAuthError() {
 		defer cancel()
 		if err := hc.refreshActiveAccountToken(ctx, account); err != nil {
 			log.Printf("Failed to refresh the chat token: %s; re-authorize the account", err)
+			// stop the failed socket and its watchdog; sending reports that
+			// the chat is not connected until the account is re-authorized
+			hc.ReconnectChat()
 			return
 		}
 		if err := hc.connectWriteSocket(); err != nil {
@@ -1198,7 +1223,7 @@ func (hc *HasherinoController) Listen() error {
 			}
 		}
 	}
-	readWS.StartListening(callbackWrapper, nil)
+	readWS.StartListening(callbackWrapper, nil, hc.notifyChatReconnected)
 	return nil
 }
 

@@ -28,6 +28,15 @@ var ErrNotConnected = errors.New("not connected")
 // purpose, so the listener stops instead of reconnecting.
 var errWebsocketClosed = errors.New("websocket closed")
 
+const (
+	// websocketStaleAfter is how long a connection may be silent before it is
+	// considered dead. Twitch sends a PING every few minutes, so a healthy
+	// connection always produces traffic well before this.
+	websocketStaleAfter = 12 * time.Minute
+	// websocketWatchdogInterval is how often the stale connection check runs.
+	websocketWatchdogInterval = 30 * time.Second
+)
+
 // TwitchChatWebsocket is one IRC-over-websocket connection. All methods are
 // safe for concurrent use: the listener goroutine reconnects and answers
 // pings while the ui sends messages.
@@ -49,6 +58,10 @@ type TwitchChatWebsocket struct {
 	closed    bool
 	listening bool
 	done      chan struct{}
+	// lastReadAt is the last time any data arrived. It survives reconnects
+	// and is used to notice connections that died while the app was
+	// suspended.
+	lastReadAt time.Time
 
 	backoff      time.Duration
 	reconnectMin time.Duration
@@ -135,6 +148,7 @@ func (w *TwitchChatWebsocket) connect() error {
 
 	w.mu.Lock()
 	w.state = Connected
+	w.lastReadAt = time.Now()
 	channels := make([]string, 0, len(w.channels))
 	for channel := range w.channels {
 		channels = append(channels, channel)
@@ -225,8 +239,10 @@ func (w *TwitchChatWebsocket) HasChannel(channel string) bool {
 
 // StartListening runs the read loop in the background. It answers pings,
 // reconnects when the connection drops, and calls onAuthError when Twitch
-// rejects the login. Only one listener is started per socket.
-func (w *TwitchChatWebsocket) StartListening(callback func(string), onAuthError func()) {
+// rejects the login. onReconnect is called after an unexpected connection
+// loss has been recovered, before new messages are read, so the caller can
+// fill the gap. Only one listener is started per socket.
+func (w *TwitchChatWebsocket) StartListening(callback func(string), onAuthError func(), onReconnect func()) {
 	w.mu.Lock()
 	if w.listening || w.closed {
 		w.mu.Unlock()
@@ -236,7 +252,7 @@ func (w *TwitchChatWebsocket) StartListening(callback func(string), onAuthError 
 	w.mu.Unlock()
 
 	go func() {
-		err := w.Listen(callback, onAuthError)
+		err := w.Listen(callback, onAuthError, onReconnect)
 		if err != nil {
 			log.Printf("chat websocket listener stopped: %s", err)
 		}
@@ -244,13 +260,57 @@ func (w *TwitchChatWebsocket) StartListening(callback func(string), onAuthError 
 		w.listening = false
 		w.mu.Unlock()
 	}()
+	go w.watchdog()
+}
+
+// watchdog drops a connection that has been silent for too long. This
+// recovers from half-open connections, for example after Android froze the
+// process and the socket died without the app being told.
+func (w *TwitchChatWebsocket) watchdog() {
+	ticker := time.NewTicker(websocketWatchdogInterval)
+	defer ticker.Stop()
+
+	for {
+		w.mu.Lock()
+		done := w.done
+		closed := w.closed
+		w.mu.Unlock()
+		if done == nil || closed {
+			return
+		}
+
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+		}
+
+		w.mu.Lock()
+		connected := w.state == Connected
+		lastReadAt := w.lastReadAt
+		w.mu.Unlock()
+
+		if !connected || lastReadAt.IsZero() {
+			continue
+		}
+		// wall clock, so a device suspend also counts as silence
+		silent := time.Duration(time.Now().UnixNano() - lastReadAt.UnixNano())
+		if silent > websocketStaleAfter {
+			log.Printf("chat connection silent for %s; reconnecting", silent.Round(time.Second))
+			w.dropConnection()
+		}
+	}
 }
 
 // Listen reads messages until the socket is closed. It answers Twitch pings,
 // reconnects after network errors, and returns after an authentication
-// failure so the caller can refresh the token.
-func (w *TwitchChatWebsocket) Listen(callback func(string), onAuthError func()) error {
+// failure so the caller can refresh the token. onReconnect is called before
+// reading resumes, after a connection loss has been recovered.
+func (w *TwitchChatWebsocket) Listen(callback func(string), onAuthError func(), onReconnect func()) error {
 	pending := ""
+	// wasConnected reports whether this listener has seen a working
+	// connection, so the reconnect hook is not called for the initial one.
+	wasConnected := false
 	for {
 		w.mu.Lock()
 		if w.closed {
@@ -270,10 +330,16 @@ func (w *TwitchChatWebsocket) Listen(callback func(string), onAuthError func()) 
 				if !w.waitBackoff() {
 					return nil
 				}
+				continue
 			}
+			if wasConnected && onReconnect != nil {
+				onReconnect()
+			}
+			wasConnected = wasConnected || w.IsConnected()
 			pending = ""
 			continue
 		}
+		wasConnected = true
 
 		_, data, err := connection.Read(ctx)
 		if err != nil {
@@ -296,6 +362,7 @@ func (w *TwitchChatWebsocket) Listen(callback func(string), onAuthError func()) 
 		// so a server that accepts and immediately closes is not hammered
 		w.mu.Lock()
 		w.backoff = w.reconnectMin
+		w.lastReadAt = time.Now()
 		w.mu.Unlock()
 
 		pending += string(data)

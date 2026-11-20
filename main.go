@@ -97,6 +97,7 @@ type chatMessageMenuState struct {
 }
 
 type chatMessage struct {
+	id          string // twitch message id, empty for messages without one
 	author      string
 	authorColor color.NRGBA
 	text        string
@@ -143,6 +144,15 @@ type chat struct {
 	menu chatMessageMenuState
 	// window is used to repaint the chat when an emote finishes loading.
 	window *app.Window
+	// lastSentAt is the newest message timestamp in the chat, used as the
+	// cursor for filling the messages missed while disconnected.
+	lastSentAt time.Time
+	// seenIDs dedupes messages that arrive both live and through a history
+	// request. seenOrder bounds the set.
+	seenIDs   map[string]struct{}
+	seenOrder []string
+	// historyLoaded reports whether the initial history request finished.
+	historyLoaded bool
 }
 
 const (
@@ -157,6 +167,18 @@ const (
 	channelEmotePollFirstInterval = 100 * time.Millisecond
 	channelEmotePollMaxInterval   = 2 * time.Second
 	channelEmotePollAttempts      = 40
+
+	// chatSeenIDLimit is how many message ids are remembered for dedupe.
+	chatSeenIDLimit = 2000
+
+	// resumeCheckInterval and resumeGapThreshold detect that the app was
+	// suspended: the ticker keeps running while the process is scheduled, so
+	// a much later tick means the process was frozen or the device slept.
+	resumeCheckInterval = 20 * time.Second
+	resumeGapThreshold  = 60 * time.Second
+	// backfillMinInterval keeps resume and reconnect events from fetching
+	// history repeatedly.
+	backfillMinInterval = 15 * time.Second
 )
 
 func (c *chat) setLimit(limit int) {
@@ -203,9 +225,7 @@ func (c *chat) takeScrollToEnd() bool {
 	return true
 }
 
-func (c *chat) append(message chatMessage) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *chat) appendLocked(message chatMessage) {
 	if c.limit <= 0 {
 		c.limit = defaultChatMessageLimit
 	}
@@ -218,6 +238,146 @@ func (c *chat) append(message chatMessage) {
 	if len(c.messages) > c.limit {
 		c.messages = c.messages[len(c.messages)-c.limit:]
 	}
+	c.trackMessageLocked(message)
+}
+
+// appendLive adds a message that arrived on the live connection.
+func (c *chat) appendLive(message hasherino.ChatMessage) bool {
+	if !shouldRenderChatMessage(message) {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if message.Id != "" && c.hasSeenLocked(message.Id) {
+		return false
+	}
+	c.appendLocked(chatMessage{
+		id:          message.Id,
+		author:      message.Author,
+		authorColor: parseHexColor(message.AuthorColor),
+		text:        message.Text,
+		sentAt:      message.Time,
+		ownEmotes:   message.Emotes,
+		rawBadges:   message.Badges,
+	})
+	return true
+}
+
+// appendHistory merges history messages into the chat. Messages at or before
+// cursor were already known when the request started; the id check catches
+// the overlap and live messages that arrived while the request was in
+// flight. The messages are inserted in timestamp order, so backfilled
+// messages stay above the newer live ones.
+func (c *chat) appendHistory(messages []hasherino.ChatMessage, cursor time.Time) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.limit <= 0 {
+		c.limit = defaultChatMessageLimit
+	}
+
+	added := 0
+	for _, message := range messages {
+		if !shouldRenderChatMessage(message) {
+			continue
+		}
+		if message.Id != "" && c.hasSeenLocked(message.Id) {
+			continue
+		}
+		if !cursor.IsZero() {
+			if message.Time.Before(cursor) {
+				continue
+			}
+			if message.Id == "" && !message.Time.After(cursor) {
+				continue
+			}
+		}
+
+		entry := chatMessage{
+			id:          message.Id,
+			author:      message.Author,
+			authorColor: parseHexColor(message.AuthorColor),
+			text:        message.Text,
+			sentAt:      message.Time,
+			ownEmotes:   message.Emotes,
+			rawBadges:   message.Badges,
+		}
+		entry.parts = c.buildPartsLocked(entry.text, entry.ownEmotes)
+		entry.badgeURLs = c.resolveBadgesLocked(entry.rawBadges)
+		entry.menu = &chatMessageMenu{}
+		c.insertLocked(entry)
+		c.trackMessageLocked(entry)
+		added++
+	}
+	if len(c.messages) > c.limit {
+		c.messages = c.messages[len(c.messages)-c.limit:]
+	}
+	return added
+}
+
+// insertLocked inserts a message by its timestamp, keeping the chat ordered
+// when old messages are backfilled after newer ones arrived.
+func (c *chat) insertLocked(message chatMessage) {
+	index := len(c.messages)
+	for i := len(c.messages) - 1; i >= 0; i-- {
+		if !c.messages[i].sentAt.After(message.sentAt) {
+			index = i + 1
+			break
+		}
+		index = i
+	}
+	c.messages = append(c.messages, chatMessage{})
+	copy(c.messages[index+1:], c.messages[index:])
+	c.messages[index] = message
+}
+
+// trackMessageLocked remembers the message id and the newest timestamp.
+func (c *chat) trackMessageLocked(message chatMessage) {
+	if message.sentAt.After(c.lastSentAt) {
+		c.lastSentAt = message.sentAt
+	}
+	if message.id == "" {
+		return
+	}
+	if c.seenIDs == nil {
+		c.seenIDs = make(map[string]struct{})
+	}
+	if _, ok := c.seenIDs[message.id]; ok {
+		return
+	}
+	c.seenIDs[message.id] = struct{}{}
+	c.seenOrder = append(c.seenOrder, message.id)
+	for len(c.seenOrder) > chatSeenIDLimit {
+		delete(c.seenIDs, c.seenOrder[0])
+		c.seenOrder = c.seenOrder[1:]
+	}
+}
+
+func (c *chat) hasSeenLocked(id string) bool {
+	if c.seenIDs == nil {
+		return false
+	}
+	_, ok := c.seenIDs[id]
+	return ok
+}
+
+// backfillCursor returns the newest message timestamp, the point new history
+// has to start after.
+func (c *chat) backfillCursor() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastSentAt
+}
+
+func (c *chat) markHistoryLoaded() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.historyLoaded = true
+}
+
+func (c *chat) historyIsLoaded() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.historyLoaded
 }
 
 // setBadges replaces the badge sets that can be rendered in the channel and
@@ -792,18 +952,9 @@ func registerTabCallback(window *app.Window, callbackMap map[string]func(hasheri
 	chat := tab.chat
 	chat.window = window
 	callbackMap[tab.login] = func(message hasherino.ChatMessage) {
-		if !shouldRenderChatMessage(message) {
-			return
+		if chat.appendLive(message) {
+			window.Invalidate()
 		}
-		chat.append(chatMessage{
-			author:      message.Author,
-			authorColor: parseHexColor(message.AuthorColor),
-			text:        message.Text,
-			sentAt:      message.Time,
-			ownEmotes:   message.Emotes,
-			rawBadges:   message.Badges,
-		})
-		window.Invalidate()
 	}
 }
 
@@ -818,6 +969,7 @@ func loadChatHistory(window *app.Window, hc *hasherino.HasherinoController, tab 
 			return
 		}
 		if !settings.ChatHistory {
+			tab.chat.markHistoryLoaded()
 			return
 		}
 
@@ -829,6 +981,7 @@ func loadChatHistory(window *app.Window, hc *hasherino.HasherinoController, tab 
 
 		history, err := hasherino.GetChatHistory(tab.login, limit)
 		if err != nil {
+			tab.chat.markHistoryLoaded()
 			log.Printf("failed to load chat history for %s: %s", tab.login, err)
 			return
 		}
@@ -839,22 +992,135 @@ func loadChatHistory(window *app.Window, hc *hasherino.HasherinoController, tab 
 		})
 
 		chat := tab.chat
-		for _, message := range messages {
-			if !shouldRenderChatMessage(message) {
-				continue
-			}
-			chat.append(chatMessage{
-				author:      message.Author,
-				authorColor: parseHexColor(message.AuthorColor),
-				text:        message.Text,
-				sentAt:      message.Time,
-				ownEmotes:   message.Emotes,
-				rawBadges:   message.Badges,
-			})
-		}
+		chat.appendHistory(messages, time.Time{})
+		chat.markHistoryLoaded()
 		chat.requestScrollToEnd()
 		window.Invalidate()
 	}()
+}
+
+// chatBackfillTarget is one chat to fill, with the cursor captured when the
+// gap was detected.
+type chatBackfillTarget struct {
+	login  string
+	chat   *chat
+	cursor time.Time
+}
+
+var (
+	// chatRegistry lets the reconnect callback and the resume watcher find
+	// the open chats without touching the ui-owned tabs slice.
+	chatRegistryLock sync.Mutex
+	chatRegistry     = make(map[*chat]string)
+	// backfillLock rate-limits history requests.
+	backfillLock sync.Mutex
+	lastBackfill time.Time
+)
+
+func registerChat(target *chat, login string) {
+	chatRegistryLock.Lock()
+	defer chatRegistryLock.Unlock()
+	chatRegistry[target] = login
+}
+
+func unregisterChat(target *chat) {
+	chatRegistryLock.Lock()
+	defer chatRegistryLock.Unlock()
+	delete(chatRegistry, target)
+}
+
+// watchResume notices that the process was suspended. The ticker runs while
+// the app is scheduled; a tick that is much later than expected means the
+// process was frozen (Android) or the device slept.
+func watchResume(done <-chan struct{}, window *app.Window, hc *hasherino.HasherinoController) {
+	ticker := time.NewTicker(resumeCheckInterval)
+	defer ticker.Stop()
+
+	last := time.Now()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			// compare wall clock rather than monotonic time: suspend stops
+			// the monotonic clock, but wall time keeps advancing
+			pause := time.Duration(now.UnixNano() - last.UnixNano())
+			if pause > resumeGapThreshold {
+				log.Printf("Detected a %s pause; backfilling chat history", pause.Round(time.Second))
+				triggerChatBackfill(window, hc)
+			}
+			last = now
+		}
+	}
+}
+
+// triggerChatBackfill fetches the recent messages of every open tab and
+// merges the ones that are missing. It is called from the websocket listener
+// (before it reads new messages again) and from the resume watcher, and
+// respects the chat history setting.
+func triggerChatBackfill(window *app.Window, hc *hasherino.HasherinoController) {
+	settings, err := hc.GetSettings()
+	if err != nil {
+		log.Printf("failed to load settings for chat backfill: %s", err)
+		return
+	}
+	if !settings.ChatHistory {
+		return
+	}
+	limit := settings.ChatMessageLimit
+	if limit <= 0 {
+		limit = 100
+	}
+
+	// capture the cursors now: new live messages may arrive while the
+	// history request is in flight and must not hide the gap
+	chatRegistryLock.Lock()
+	targets := make([]chatBackfillTarget, 0, len(chatRegistry))
+	for target, login := range chatRegistry {
+		if !target.historyIsLoaded() {
+			continue
+		}
+		targets = append(targets, chatBackfillTarget{
+			login:  login,
+			chat:   target,
+			cursor: target.backfillCursor(),
+		})
+	}
+	chatRegistryLock.Unlock()
+	if len(targets) == 0 {
+		return
+	}
+
+	backfillLock.Lock()
+	if time.Since(lastBackfill) < backfillMinInterval {
+		backfillLock.Unlock()
+		return
+	}
+	lastBackfill = time.Now()
+	backfillLock.Unlock()
+
+	for _, target := range targets {
+		target := target
+		go backfillChat(window, target, limit)
+	}
+}
+
+func backfillChat(window *app.Window, target chatBackfillTarget, limit int) {
+	history, err := hasherino.GetChatHistory(target.login, limit)
+	if err != nil {
+		log.Printf("failed to backfill chat history for %s: %s", target.login, err)
+		return
+	}
+
+	messages := *history
+	sort.Slice(messages, func(i, j int) bool {
+		return messages[i].Time.Before(messages[j].Time)
+	})
+	if added := target.chat.appendHistory(messages, target.cursor); added > 0 {
+		log.Printf("Backfilled %d messages for %s", added, target.login)
+		window.Invalidate()
+	}
 }
 
 // loadChannelEmotes waits for the emotes of the channel to become available
@@ -3335,6 +3601,14 @@ func run(window *app.Window) error {
 		return err
 	}
 
+	hc.SetChatReconnectHook(func() {
+		triggerChatBackfill(window, hc)
+	})
+
+	resumeDone := make(chan struct{})
+	defer close(resumeDone)
+	go watchResume(resumeDone, window, hc)
+
 	emoteStore = openEmoteStore()
 	hc.SetEmoteRefreshHook(func(emotes []*hasherino.Emote) {
 		// a refreshed list reported new or changed content; drop the old
@@ -3484,6 +3758,7 @@ func run(window *app.Window) error {
 		loadChannelEmotes(window, hc, &item)
 		loadChannelBadges(window, hc, &item)
 		tabs = append(tabs, item)
+		registerChat(item.chat, item.login)
 		tabIds = append(tabIds, saved.Id)
 		if selectedLogin != "" && strings.EqualFold(saved.Login, selectedLogin) {
 			selectedTab = len(tabs) - 1
@@ -3568,6 +3843,7 @@ func run(window *app.Window) error {
 					loadChannelEmotes(window, hc, &item)
 					loadChannelBadges(window, hc, &item)
 					tabs = append(tabs, item)
+					registerChat(item.chat, item.login)
 					selectedTab = len(tabs) - 1
 					if err := hc.SetSelectedTab(item.login); err != nil {
 						log.Printf("failed to save selected tab: %s", err)
@@ -3625,6 +3901,7 @@ func run(window *app.Window) error {
 						log.Printf("failed to remove tab %s: %s", closed.login, err)
 					} else {
 						delete(callbackMap, closed.login)
+						unregisterChat(closed.chat)
 						tabs = append(tabs[:closeIndex], tabs[closeIndex+1:]...)
 						adjustSelection(&selectedTab, closeIndex, len(tabs))
 						if selectedTab >= 0 && selectedTab < len(tabs) {

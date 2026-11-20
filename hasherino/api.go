@@ -571,6 +571,10 @@ type ChatMessagesJson struct {
 	ErrorCode any      `json:"error_code"`
 }
 
+// chatHistoryClient keeps a slow history service from hanging a backfill
+// goroutine forever.
+var chatHistoryClient = &http.Client{Timeout: 15 * time.Second}
+
 func GetChatHistory(channel string, limit int) (*[]ChatMessage, error) {
 	url := "https://recent-messages.robotty.de/api/v2/recent-messages/"
 	url += channel
@@ -582,11 +586,12 @@ func GetChatHistory(channel string, limit int) (*[]ChatMessage, error) {
 		return nil, err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := chatHistoryClient.Do(req)
 	if err != nil {
 		log.Printf("Failed to get chat history: %s", err)
 		return nil, err
 	}
+	defer resp.Body.Close()
 	log.Printf("Chat history status code: %d", resp.StatusCode)
 
 	body, err := io.ReadAll(resp.Body)
