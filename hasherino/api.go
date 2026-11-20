@@ -705,6 +705,78 @@ func (h *Helix) GetUserEmotes(token string, userId string) (*[]HelixUserEmote, e
 	return &emotes, nil
 }
 
+// GetChannelEmotes returns every emote available in a channel, including
+// subscription, bits and follower emotes.
+func (h *Helix) GetChannelEmotes(token string, broadcasterID string) (*[]HelixUserEmote, error) {
+	emotes := []HelixUserEmote{}
+	cursor := ""
+	for range maxUserEmotePages {
+		requestURL := "https://api.twitch.tv/helix/chat/emotes?broadcaster_id=" + url.QueryEscape(broadcasterID)
+		if cursor != "" {
+			requestURL += "&after=" + url.QueryEscape(cursor)
+		}
+
+		req, err := http.NewRequest("GET", requestURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Add("Authorization", "Bearer "+token)
+		req.Header.Add("Client-Id", h.appId)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("failed to get the emotes of channel %s: %s", broadcasterID, resp.Status)
+		}
+
+		var page HelixUserEmotes
+		if err := json.Unmarshal(body, &page); err != nil {
+			return nil, err
+		}
+		emotes = append(emotes, page.Data...)
+		cursor = page.Pagination.Cursor
+		if cursor == "" {
+			break
+		}
+	}
+	return &emotes, nil
+}
+
+// GetGlobalEmotes returns Twitch's global emotes.
+func (h *Helix) GetGlobalEmotes(token string) (*[]HelixUserEmote, error) {
+	req, err := http.NewRequest("GET", "https://api.twitch.tv/helix/chat/emotes/global", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Add("Authorization", "Bearer "+token)
+	req.Header.Add("Client-Id", h.appId)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get global emotes: %s", resp.Status)
+	}
+	var page HelixUserEmotes
+	if err := json.Unmarshal(body, &page); err != nil {
+		return nil, err
+	}
+	return &page.Data, nil
+}
+
 // STVFile is one file variant of a 7tv emote, e.g. its 2x webp.
 type STVFile struct {
 	Name   string `json:"name"`

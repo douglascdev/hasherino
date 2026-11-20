@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -786,6 +787,117 @@ func (hc *HasherinoController) searchEmotes(source *EmoteSourceEnum, search stri
 
 func escapeLikePattern(value string) string {
 	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(value)
+}
+
+// EmotePickerSection is one titled group in the emote picker, like the
+// subscription emotes of one channel.
+type EmotePickerSection struct {
+	Title  string
+	Emotes []*Emote
+}
+
+// EmotePickerData is the emote catalog shown by the picker.
+type EmotePickerData struct {
+	Subs          []EmotePickerSection
+	Channel       []*Emote
+	GlobalTwitch  []*Emote
+	GlobalSevenTV []*Emote
+}
+
+// LoadEmotePicker collects the emotes shown in the picker for the given
+// channel. Subscription emotes are those the user can use, grouped by the
+// channel that provides them.
+func (hc *HasherinoController) LoadEmotePicker(channelLogin string) (*EmotePickerData, error) {
+	data := &EmotePickerData{}
+	account, err := hc.GetActiveAccount()
+	if err != nil {
+		return data, err
+	}
+
+	helix := NewHelix(hc.appId)
+	var firstErr error
+	subscriptions := make(map[string]struct{})
+	userEmotes, err := helix.GetUserEmotes(account.Token, account.Id)
+	if err != nil {
+		firstErr = err
+	} else {
+		for _, emote := range *userEmotes {
+			emoteType := strings.ToLower(emote.EmoteType)
+			switch {
+			case strings.Contains(emoteType, "global"):
+				data.GlobalTwitch = append(data.GlobalTwitch, pickerEmote(emote))
+			case strings.Contains(emoteType, "subscription"):
+				subscriptions[emote.ID] = struct{}{}
+			}
+		}
+		if len(data.GlobalTwitch) == 0 {
+			if globalEmotes, err := helix.GetGlobalEmotes(account.Token); err == nil {
+				for _, emote := range *globalEmotes {
+					data.GlobalTwitch = append(data.GlobalTwitch, pickerEmote(emote))
+				}
+			}
+		}
+	}
+
+	tabs, err := hc.GetTabs()
+	if err != nil {
+		return data, err
+	}
+	var selected *Tab
+	for _, tab := range tabs {
+		if strings.EqualFold(tab.Login, channelLogin) {
+			selected = tab
+		}
+		channelEmotes, err := helix.GetChannelEmotes(account.Token, tab.Id)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		section := EmotePickerSection{Title: tab.DisplayName}
+		if section.Title == "" {
+			section.Title = tab.Login
+		}
+		for _, emote := range *channelEmotes {
+			if _, ok := subscriptions[emote.ID]; !ok {
+				continue
+			}
+			section.Emotes = append(section.Emotes, pickerEmote(emote))
+		}
+		if len(section.Emotes) > 0 {
+			sortEmotes(section.Emotes)
+			data.Subs = append(data.Subs, section)
+		}
+	}
+	sort.Slice(data.Subs, func(i, j int) bool {
+		return strings.ToLower(data.Subs[i].Title) < strings.ToLower(data.Subs[j].Title)
+	})
+
+	if selected != nil {
+		hc.memDB.Where("source = ? AND channel_id = ? AND owner_id = ''", SevenTV, selected.Id).Find(&data.Channel)
+	}
+	hc.memDB.Where("source = ? AND owner_id = '' AND channel_id IS NULL", SevenTV).Find(&data.GlobalSevenTV)
+
+	sortEmotes(data.GlobalTwitch)
+	sortEmotes(data.GlobalSevenTV)
+	sortEmotes(data.Channel)
+	return data, firstErr
+}
+
+func pickerEmote(emote HelixUserEmote) *Emote {
+	return &Emote{
+		Id:       emote.ID,
+		Source:   Twitch,
+		Name:     emote.Name,
+		Animated: emote.Animated(),
+	}
+}
+
+func sortEmotes(emotes []*Emote) {
+	sort.Slice(emotes, func(i, j int) bool {
+		return strings.ToLower(emotes[i].Name) < strings.ToLower(emotes[j].Name)
+	})
 }
 
 // GetChannelEmotes returns every emote that can be rendered in the given channel,

@@ -760,6 +760,7 @@ type emoteSuggestionRow struct {
 type messageInputState struct {
 	editor       widget.Editor
 	sendButton   widget.Clickable
+	pickerButton widget.Clickable
 	cancelReply  widget.Clickable
 	replyJump    widget.Clickable
 	suggestions  []*hasherino.Emote
@@ -1492,10 +1493,14 @@ func replaceToken(text string, tokenStart, tokenEnd int, replacement string) (st
 	return string(replaced), tokenStart + len(replacementRunes)
 }
 
-func layoutMessageInput(gtx layout.Context, theme *material.Theme, state *messageInputState, hc *hasherino.HasherinoController, window *app.Window, selectedLogin string, selectedChat *chat, closeIcon, sendIcon *widget.Icon) layout.Dimensions {
+func layoutMessageInput(gtx layout.Context, theme *material.Theme, state *messageInputState, hc *hasherino.HasherinoController, window *app.Window, selectedLogin string, selectedChat *chat, closeIcon, sendIcon, emoticonIcon *widget.Icon) layout.Dimensions {
 	state.drainSearchEvents()
 	state.handleInputKeys(gtx, hc, selectedLogin, selectedChat)
 	state.updateSearch(gtx, window, hc)
+	if state.pickerButton.Clicked(gtx) {
+		chatEmotePicker.openPicker(hc, window, selectedLogin)
+		gtx.Execute(op.InvalidateCmd{})
+	}
 
 	if selectedChat != nil && selectedChat.reply != nil && state.cancelReply.Clicked(gtx) {
 		selectedChat.reply = nil
@@ -1511,7 +1516,7 @@ func layoutMessageInput(gtx layout.Context, theme *material.Theme, state *messag
 		var inputDims layout.Dimensions
 		return layout.Stack{Alignment: layout.S}.Layout(gtx,
 			layout.Stacked(func(gtx layout.Context) layout.Dimensions {
-				inputDims = layoutMessageInputRow(gtx, theme, state, hc, selectedLogin, selectedChat, sendIcon)
+				inputDims = layoutMessageInputRow(gtx, theme, state, hc, selectedLogin, selectedChat, sendIcon, emoticonIcon)
 				return inputDims
 			}),
 			layout.Stacked(func(gtx layout.Context) layout.Dimensions {
@@ -1652,7 +1657,7 @@ func (s *messageInputState) handleInputKey(gtx layout.Context, name key.Name, hc
 	}
 }
 
-func layoutMessageInputRow(gtx layout.Context, theme *material.Theme, state *messageInputState, hc *hasherino.HasherinoController, selectedLogin string, selectedChat *chat, sendIcon *widget.Icon) layout.Dimensions {
+func layoutMessageInputRow(gtx layout.Context, theme *material.Theme, state *messageInputState, hc *hasherino.HasherinoController, selectedLogin string, selectedChat *chat, sendIcon, emoticonIcon *widget.Icon) layout.Dimensions {
 	if state.sendButton.Clicked(gtx) {
 		state.send(gtx, hc, selectedLogin, selectedChat)
 	}
@@ -1667,7 +1672,16 @@ func layoutMessageInputRow(gtx layout.Context, theme *material.Theme, state *mes
 				editor.TextSize = unit.Sp(16)
 				return editor.Layout(gtx)
 			}),
-			layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				style := material.IconButton(theme, &state.pickerButton, emoticonIcon, "Emote picker")
+				style.Background = color.NRGBA{}
+				style.Color = theme.Fg
+				style.Size = 20
+				style.Inset = layout.UniformInset(6)
+				return style.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(6)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				style := material.IconButton(theme, &state.sendButton, sendIcon, "Send message")
 				style.Background = theme.ContrastBg
@@ -4531,6 +4545,10 @@ func run(window *app.Window) error {
 	if err != nil {
 		return err
 	}
+	emoticonIcon, err := widget.NewIcon(icons.EditorInsertEmoticon)
+	if err != nil {
+		return err
+	}
 
 	addButton := new(widget.Clickable)
 	addIcon, err := widget.NewIcon(icons.ContentAdd)
@@ -4687,7 +4705,7 @@ func run(window *app.Window) error {
 							return tabs[selectedTab].chat.layout(gtx, theme)
 						}),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							return layoutMessageInput(gtx, theme, messageInput, hc, window, selectedLogin, selectedChat, closeIcon, sendIcon)
+							return layoutMessageInput(gtx, theme, messageInput, hc, window, selectedLogin, selectedChat, closeIcon, sendIcon, emoticonIcon)
 						}),
 					)
 				}),
@@ -4713,6 +4731,9 @@ func run(window *app.Window) error {
 				}),
 				layout.Stacked(func(gtx layout.Context) layout.Dimensions {
 					return layoutSettings(gtx, theme, hc, settings)
+				}),
+				layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+					return chatEmotePicker.layout(gtx, theme, window, messageInput, closeIcon)
 				}),
 				layout.Stacked(func(gtx layout.Context) layout.Dimensions {
 					return emoteTooltip.layout(gtx, theme, window)

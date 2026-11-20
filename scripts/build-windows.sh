@@ -53,7 +53,7 @@ export CXX=x86_64-w64-mingw32-g++
 # source tree with only the Gio entry point so the Fyne main is not included.
 STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hasherino-windows-XXXXXX")"
 trap 'rm -rf "$STAGE_DIR"' EXIT
-cp "$ROOT_DIR/main.go" "$ROOT_DIR/go.mod" "$ROOT_DIR/go.sum" "$STAGE_DIR/"
+cp "$ROOT_DIR/main.go" "$ROOT_DIR/open_url_android.go" "$ROOT_DIR/open_url_desktop.go" "$ROOT_DIR/emoji_data.go" "$ROOT_DIR/emote_picker.go" "$ROOT_DIR/data-by-emoji.json" "$ROOT_DIR/go.mod" "$ROOT_DIR/go.sum" "$STAGE_DIR/"
 cp -R "$ROOT_DIR/hasherino" "$STAGE_DIR/hasherino"
 cp -R "$ROOT_DIR/emotecache" "$STAGE_DIR/emotecache"
 
