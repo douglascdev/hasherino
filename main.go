@@ -98,6 +98,7 @@ type chatMessageMenuState struct {
 
 type chatMessage struct {
 	id          string // twitch message id, empty for messages without one
+	seq         uint64 // stable identity within the chat
 	author      string
 	authorColor color.NRGBA
 	text        string
@@ -144,6 +145,21 @@ type chat struct {
 	menu chatMessageMenuState
 	// window is used to repaint the chat when an emote finishes loading.
 	window *app.Window
+	// version changes whenever messages are added or removed, so the layout
+	// knows when to restore the scroll anchor.
+	version uint64
+	// nextSeq numbers messages, giving each a stable identity while it is in
+	// the chat; the scroll anchor is expressed in terms of it.
+	nextSeq uint64
+	// atBottom reports whether the previous layout was near the bottom, so
+	// a newly arriving message should follow the end.
+	atBottom bool
+	// anchorSeq and anchorOffset describe the first visible message and how
+	// far it is scrolled. They keep the viewport on the same messages when
+	// the message slice changes.
+	anchorSeq     uint64
+	anchorOffset  int
+	anchorVersion uint64
 	// lastSentAt is the newest message timestamp in the chat, used as the
 	// cursor for filling the messages missed while disconnected.
 	lastSentAt time.Time
@@ -170,6 +186,9 @@ const (
 
 	// chatSeenIDLimit is how many message ids are remembered for dedupe.
 	chatSeenIDLimit = 2000
+	// chatNearBottomDistance is how close to the end the viewport has to be
+	// for a new message to follow the bottom.
+	chatNearBottomDistance = unit.Dp(48)
 
 	// resumeCheckInterval and resumeGapThreshold detect that the app was
 	// suspended: the ticker keeps running while the process is scheduled, so
@@ -190,6 +209,10 @@ func (c *chat) setLimit(limit int) {
 	c.limit = limit
 	if len(c.messages) > limit {
 		c.messages = c.messages[len(c.messages)-limit:]
+		c.version++
+		if c.atBottom {
+			c.scrollToEnd = true
+		}
 	}
 }
 
@@ -228,6 +251,12 @@ func (c *chat) takeScrollToEnd() bool {
 func (c *chat) appendLocked(message chatMessage) {
 	if c.limit <= 0 {
 		c.limit = defaultChatMessageLimit
+	}
+	c.nextSeq++
+	message.seq = c.nextSeq
+	c.version++
+	if c.atBottom {
+		c.scrollToEnd = true
 	}
 	message.parts = c.buildPartsLocked(message.text, message.ownEmotes)
 	message.badgeURLs = c.resolveBadgesLocked(message.rawBadges)
@@ -292,8 +321,10 @@ func (c *chat) appendHistory(messages []hasherino.ChatMessage, cursor time.Time)
 			}
 		}
 
+		c.nextSeq++
 		entry := chatMessage{
 			id:          message.Id,
+			seq:         c.nextSeq,
 			author:      message.Author,
 			authorColor: parseHexColor(message.AuthorColor),
 			text:        message.Text,
@@ -310,6 +341,12 @@ func (c *chat) appendHistory(messages []hasherino.ChatMessage, cursor time.Time)
 	}
 	if len(c.messages) > c.limit {
 		c.messages = c.messages[len(c.messages)-c.limit:]
+	}
+	if added > 0 {
+		c.version++
+		if c.atBottom {
+			c.scrollToEnd = true
+		}
 	}
 	return added
 }
@@ -501,11 +538,16 @@ func (c *chat) requestBadges(message chatMessage) {
 }
 
 func (c *chat) snapshot() []chatMessage {
+	messages, _ := c.snapshotState()
+	return messages
+}
+
+func (c *chat) snapshotState() ([]chatMessage, uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	messages := make([]chatMessage, len(c.messages))
 	copy(messages, c.messages)
-	return messages
+	return messages, c.version
 }
 
 type userEntry struct {
@@ -1592,6 +1634,7 @@ func newChat() *chat {
 		emotes:    make(map[string]*hasherino.Emote),
 		showTime:  true,
 		emoteSize: unit.Dp(22),
+		atBottom:  true,
 	}
 }
 
@@ -2030,10 +2073,20 @@ func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensio
 		emoteHeight: gtx.Dp(c.emoteSize),
 		menu:        &c.menu,
 	}
-	messages := c.snapshot()
-	if c.takeScrollToEnd() {
+	messages, version := c.snapshotState()
+	dragging := c.list.List.Dragging() || c.list.Scrollbar.Dragging()
+	followEnd := c.takeScrollToEnd()
+	if followEnd && dragging {
+		// do not interrupt a scroll the user just started
+		followEnd = false
+	}
+	if followEnd {
 		c.list.ScrollToEnd = true
 		c.list.Position.BeforeEnd = false
+	} else if !dragging && version != c.anchorVersion && !(c.list.ScrollToEnd && !c.list.Position.BeforeEnd) {
+		// the message slice changed while the user was reading further up;
+		// keep the same message at the top of the viewport
+		c.restoreAnchor(messages)
 	}
 	c.list.Gap = gtx.Dp(unit.Dp(8))
 	dims := layout.Inset{
@@ -2041,7 +2094,7 @@ func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensio
 		Right: unit.Dp(12),
 	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		heights := make(map[int]int)
-		dims := material.List(theme, &c.list).Layout(gtx, len(messages), func(gtx layout.Context, index int) layout.Dimensions {
+		listDims := material.List(theme, &c.list).Layout(gtx, len(messages), func(gtx layout.Context, index int) layout.Dimensions {
 			c.requestEmotes(messages[index])
 			c.requestBadges(messages[index])
 			itemDims := layoutChatMessage(gtx, theme, messages[index], &animator)
@@ -2053,10 +2106,64 @@ func (c *chat) layout(gtx layout.Context, theme *material.Theme) layout.Dimensio
 			return itemDims
 		})
 		c.layoutMenuOverlay(gtx, theme, messages, heights)
-		return dims
+		return listDims
 	})
+	c.updateScrollState(messages, version, gtx.Dp(chatNearBottomDistance))
 	animator.invalidate(gtx)
 	return dims
+}
+
+// restoreAnchor moves the viewport back to the message it was showing when
+// messages were added or removed. If that message was trimmed, the oldest
+// remaining message is shown instead.
+func (c *chat) restoreAnchor(messages []chatMessage) {
+	if c.anchorSeq == 0 {
+		return
+	}
+	for i := range messages {
+		if messages[i].seq == c.anchorSeq {
+			c.list.Position.First = i
+			c.list.Position.Offset = c.anchorOffset
+			return
+		}
+	}
+	c.list.Position.First = 0
+	c.list.Position.Offset = 0
+}
+
+// updateScrollState records whether the viewport is near the bottom and which
+// message is currently at the top. A new message follows the end when the
+// previous layout was near the bottom; otherwise the anchor keeps the same
+// messages visible.
+func (c *chat) updateScrollState(messages []chatMessage, version uint64, nearBottom int) {
+	position := c.list.Position
+	near := len(messages) == 0
+	if !near && position.First+position.Count >= len(messages) {
+		remaining := position.OffsetLast
+		if remaining >= 0 {
+			// the last message is fully visible above the bottom edge
+			near = true
+		} else {
+			near = -remaining <= nearBottom
+		}
+	}
+
+	first := position.First
+	if first >= len(messages) {
+		first = len(messages) - 1
+	}
+	if first >= 0 && first < len(messages) {
+		c.anchorSeq = messages[first].seq
+		c.anchorOffset = position.Offset
+	} else {
+		c.anchorSeq = 0
+		c.anchorOffset = 0
+	}
+	c.anchorVersion = version
+
+	c.mu.Lock()
+	c.atBottom = near
+	c.mu.Unlock()
 }
 
 func layoutChatMessage(gtx layout.Context, theme *material.Theme, message chatMessage, animator *chatAnimator) layout.Dimensions {
