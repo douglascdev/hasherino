@@ -89,6 +89,12 @@ type chatMessageMenu struct {
 	copyButton     widget.Clickable
 	copyFullButton widget.Clickable
 	panel          widget.Clickable
+	// touch long press state: the menu opens after the finger stays on the
+	// message long enough without turning into a scroll.
+	pressPending bool
+	pressID      pointer.ID
+	pressAt      time.Time
+	pressPos     image.Point
 }
 
 // chatMessageMenuState tracks which message menu is currently open in a chat,
@@ -192,6 +198,12 @@ const (
 	// chatNearBottomDistance is how close to the end the viewport has to be
 	// for a new message to follow the bottom.
 	chatNearBottomDistance = unit.Dp(48)
+	// chatLongPressDuration is how long a touch has to rest on a message
+	// before its actions menu opens.
+	chatLongPressDuration = 500 * time.Millisecond
+	// chatLongPressSlop is how far a touch may move before the long press is
+	// cancelled in favor of scrolling.
+	chatLongPressSlop = unit.Dp(8)
 
 	// resumeCheckInterval and resumeGapThreshold detect that the app was
 	// suspended: the ticker keeps running while the process is scheduled, so
@@ -2442,30 +2454,86 @@ func layoutChatMessage(gtx layout.Context, theme *material.Theme, message chatMe
 		for {
 			ev, ok := gtx.Event(pointer.Filter{
 				Target: message.menu,
-				Kinds:  pointer.Press,
+				Kinds:  pointer.Press | pointer.Release | pointer.Cancel | pointer.Drag | pointer.Move,
 			})
 			if !ok {
 				break
 			}
 			e, ok := ev.(pointer.Event)
-			if !ok || e.Kind != pointer.Press || e.Source != pointer.Mouse {
+			if !ok {
 				continue
 			}
-			switch {
-			case e.Buttons.Contain(pointer.ButtonSecondary):
-				if animator.menu.open == message.menu {
-					animator.menu.open = nil
-				} else {
-					animator.menu.open = message.menu
-					animator.menu.message = message
-					animator.menu.anchorX = e.Position.Round().X
+			// A scroll gesture grabs the pointer and cancels the other
+			// handlers. That synthetic cancel has no source or pointer id,
+			// so it has to be handled before the source checks below.
+			if e.Kind == pointer.Cancel {
+				message.menu.pressPending = false
+				continue
+			}
+			if e.Kind == pointer.Press && e.Source == pointer.Mouse {
+				switch {
+				case e.Buttons.Contain(pointer.ButtonSecondary):
+					if animator.menu.open == message.menu {
+						animator.menu.open = nil
+					} else {
+						animator.menu.open = message.menu
+						animator.menu.message = message
+						animator.menu.anchorX = e.Position.Round().X
+						emoteTooltip.hide()
+					}
+					gtx.Execute(op.InvalidateCmd{})
+				case e.Buttons.Contain(pointer.ButtonPrimary):
+					if animator.menu.open != nil {
+						animator.menu.open = nil
+						gtx.Execute(op.InvalidateCmd{})
+					}
 				}
-				gtx.Execute(op.InvalidateCmd{})
-			case e.Buttons.Contain(pointer.ButtonPrimary):
-				if animator.menu.open != nil {
+				continue
+			}
+
+			if e.Source == pointer.Mouse {
+				continue
+			}
+			switch e.Kind {
+			case pointer.Press:
+				if animator.menu.open != nil && animator.menu.open != message.menu {
 					animator.menu.open = nil
 					gtx.Execute(op.InvalidateCmd{})
 				}
+				message.menu.pressPending = true
+				message.menu.pressID = e.PointerID
+				message.menu.pressAt = time.Now()
+				message.menu.pressPos = e.Position.Round()
+				gtx.Execute(op.InvalidateCmd{At: message.menu.pressAt.Add(chatLongPressDuration)})
+			case pointer.Release:
+				if message.menu.pressPending && e.PointerID == message.menu.pressID {
+					message.menu.pressPending = false
+				}
+			case pointer.Drag, pointer.Move:
+				if !message.menu.pressPending || e.PointerID != message.menu.pressID {
+					continue
+				}
+				position := e.Position.Round()
+				dx := position.X - message.menu.pressPos.X
+				dy := position.Y - message.menu.pressPos.Y
+				slop := gtx.Dp(chatLongPressSlop)
+				if dx*dx+dy*dy > slop*slop {
+					message.menu.pressPending = false
+				}
+			}
+		}
+
+		if message.menu.pressPending {
+			deadline := message.menu.pressAt.Add(chatLongPressDuration)
+			if time.Now().Before(deadline) {
+				gtx.Execute(op.InvalidateCmd{At: deadline})
+			} else {
+				message.menu.pressPending = false
+				animator.menu.open = message.menu
+				animator.menu.message = message
+				animator.menu.anchorX = message.menu.pressPos.X
+				emoteTooltip.hide()
+				gtx.Execute(op.InvalidateCmd{})
 			}
 		}
 	}
