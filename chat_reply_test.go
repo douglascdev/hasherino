@@ -13,6 +13,7 @@ func TestChatAppendLiveKeepsReplyContext(t *testing.T) {
 		Id:                "child",
 		Command:           "PRIVMSG",
 		Author:            "bob",
+		DisplayName:       "Bob",
 		Text:              "@alice reply",
 		Time:              time.Unix(1_700_000_000, 0),
 		ReplyParentID:     "parent",
@@ -33,6 +34,9 @@ func TestChatAppendLiveKeepsReplyContext(t *testing.T) {
 	}
 	if messages[0].text != "reply" {
 		t.Errorf("expected the reply mention to be removed, got %q", messages[0].text)
+	}
+	if messages[0].author != "Bob" {
+		t.Errorf("expected the display name in chat, got %q", messages[0].author)
 	}
 }
 

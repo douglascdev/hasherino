@@ -338,6 +338,15 @@ func stripReplyMention(text, login, displayName string) string {
 	return text
 }
 
+// chatAuthorName returns the name rendered in chat, preferring the display
+// name's capitalization over the lower case login.
+func chatAuthorName(message hasherino.ChatMessage) string {
+	if message.DisplayName != "" {
+		return message.DisplayName
+	}
+	return message.Author
+}
+
 // appendLive adds a message that arrived on the live connection.
 func (c *chat) appendLive(message hasherino.ChatMessage) bool {
 	if !shouldRenderChatMessage(message) {
@@ -350,7 +359,7 @@ func (c *chat) appendLive(message hasherino.ChatMessage) bool {
 	}
 	c.appendLocked(chatMessage{
 		id:          message.Id,
-		author:      message.Author,
+		author:      chatAuthorName(message),
 		authorColor: parseHexColor(message.AuthorColor),
 		text:        stripReplyMention(message.Text, message.ReplyParentLogin, message.ReplyParentAuthor),
 		sentAt:      message.Time,
@@ -396,7 +405,7 @@ func (c *chat) appendHistory(messages []hasherino.ChatMessage, cursor time.Time)
 		entry := chatMessage{
 			id:          message.Id,
 			seq:         c.nextSeq,
-			author:      message.Author,
+			author:      chatAuthorName(message),
 			authorColor: parseHexColor(message.AuthorColor),
 			text:        stripReplyMention(message.Text, message.ReplyParentLogin, message.ReplyParentAuthor),
 			sentAt:      message.Time,

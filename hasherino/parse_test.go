@@ -69,6 +69,27 @@ func TestParseMessageExtractsMessageId(t *testing.T) {
 	}
 }
 
+func TestParseMessageExtractsDisplayName(t *testing.T) {
+	msg, err := ParseMessage(`@display-name=Alice;tmi-sent-ts=1700000000000 :alice!alice@alice.tmi.twitch.tv PRIVMSG #channel :hello`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Author != "alice" {
+		t.Errorf("unexpected login: %q", msg.Author)
+	}
+	if msg.DisplayName != "Alice" {
+		t.Errorf("unexpected display name: %q", msg.DisplayName)
+	}
+
+	msg, err = ParseMessage(`@tmi-sent-ts=1700000000000 :alice!alice@alice.tmi.twitch.tv PRIVMSG #channel :hello`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.DisplayName != "alice" {
+		t.Errorf("expected the login as display name fallback, got %q", msg.DisplayName)
+	}
+}
+
 func TestParseMessageExtractsReplyParent(t *testing.T) {
 	message := `@id=child;reply-parent-msg-id=parent;reply-parent-user-login=alice;reply-parent-display-name=Alice;reply-parent-msg-body=hello\sworld :bob!bob@bob.tmi.twitch.tv PRIVMSG #channel :reply`
 	msg, err := ParseMessage(message)

@@ -24,7 +24,8 @@ type ChatMessage struct {
 	ReplyParentLogin  string
 	ReplyParentAuthor string
 	ReplyParentText   string
-	Author            string
+	Author            string // twitch login, lower case
+	DisplayName       string // display name from the irc tags, preserves capitalization
 	AuthorColor       string // hex color of the author's name from the irc tags, empty when unset
 	Text              string
 	Time              time.Time
@@ -59,6 +60,10 @@ func ParseMessage(message string) (*ChatMessage, error) {
 	if replyAuthor == "" {
 		replyAuthor = msg.Tags["reply-parent-user-login"]
 	}
+	displayName := msg.Tags["display-name"]
+	if displayName == "" {
+		displayName = msg.Name
+	}
 	return &ChatMessage{
 		Channel:           channel,
 		Command:           msg.Command,
@@ -68,6 +73,7 @@ func ParseMessage(message string) (*ChatMessage, error) {
 		ReplyParentAuthor: replyAuthor,
 		ReplyParentText:   msg.Tags["reply-parent-msg-body"],
 		Author:            msg.Name,
+		DisplayName:       displayName,
 		AuthorColor:       msg.Tags["color"],
 		Text:              paramsText,
 		Time:              sentAt,
