@@ -2904,7 +2904,7 @@ func layoutChatParts(gtx layout.Context, theme *material.Theme, message chatMess
 			continue
 		}
 		widgets = append(widgets, func(gtx layout.Context) layout.Dimensions {
-			return layoutChatBadge(gtx, media)
+			return layoutChatBadge(gtx, theme, media)
 		})
 		widgets = append(widgets, layoutInlineSpacer(unit.Dp(2)))
 	}
@@ -3247,11 +3247,15 @@ func layoutInlineSpacer(width unit.Dp) layout.Widget {
 	}
 }
 
-func layoutChatBadge(gtx layout.Context, media *chatMedia) layout.Dimensions {
+func layoutChatBadge(gtx layout.Context, theme *material.Theme, media *chatMedia) layout.Dimensions {
 	if media == nil || len(media.frames) == 0 {
 		return layout.Dimensions{}
 	}
-	height := gtx.Dp(unit.Dp(18))
+	// Badges are one em tall, so they scale with the configured font size.
+	height := gtx.Metric.Sp(theme.TextSize)
+	if height <= 0 {
+		height = gtx.Dp(unit.Dp(18))
+	}
 	width := height
 	if media.width > 0 && media.height > 0 {
 		width = height * media.width / media.height
